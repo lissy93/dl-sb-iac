@@ -464,30 +464,32 @@ async function updateDomainData(
     }
 
     // 7. Dates
-    if (!areDatesEqual(domainInfo.dates.expiry_date, currentDomain.expiry_date)) {
+    const newExpiry = sanitizeDate(domainInfo.dates.expiry_date);
+    if (newExpiry && !areDatesEqual(newExpiry, currentDomain.expiry_date)) {
       await recordDomainChange(
         domainId,
         userId,
         "updated",
         "dates_expiry",
         currentDomain.expiry_date,
-        domainInfo.dates.expiry_date,
+        newExpiry,
       );
       await supabase.from("domains").update({
-        expiry_date: sanitizeDate(domainInfo.dates.expiry_date),
+        expiry_date: newExpiry,
       }).eq("id", domainId);
     }
-    if (!areDatesEqual(domainInfo.dates.updated_date, currentDomain.updated_date)) {
+    const newUpdated = sanitizeDate(domainInfo.dates.updated_date);
+    if (newUpdated && !areDatesEqual(newUpdated, currentDomain.updated_date)) {
       await recordDomainChange(
         domainId,
         userId,
         "updated",
         "dates_updated",
         currentDomain.updated_date,
-        domainInfo.dates.updated_date,
+        newUpdated,
       );
       await supabase.from("domains").update({
-        updated_date: sanitizeDate(domainInfo.dates.updated_date),
+        updated_date: newUpdated,
       }).eq("id", domainId);
     }
   } catch (error) {
