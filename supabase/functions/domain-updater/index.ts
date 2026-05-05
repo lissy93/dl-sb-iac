@@ -1,64 +1,78 @@
 /**
- * Triggered by the trigger-updates function, with a { domain, user_id } payload.
- * For each domain, fetches the latest info from DO endpoint
- * then compares it with the current domain info in the database,
- * updating the database and triggering notifications if necessary.
+ * Triggered by domain-update-worker (or trigger-updates) with { domain, user_id }.
+ * Resolves the latest info inline (or via AS93 legacy endpoint if explicitly enabled),
+ * compares with the database, then writes diffs and notifications.
  */
 
 import { serve } from "../shared/serveWithCors.ts";
 import { getSupabaseClient } from "../shared/supabaseClient.ts";
 import { Logger } from "../shared/logger.ts";
+import { resolveDomainInfo } from "../shared/domainResolver.ts";
 
-// Endpoints
 const AS93_DOMAIN_INFO_URL = Deno.env.get("AS93_DOMAIN_INFO_URL") ?? "";
 const AS93_DOMAIN_INFO_KEY = Deno.env.get("AS93_DOMAIN_INFO_KEY") ?? "";
+const USE_AS93_LEGACY = Deno.env.get("USE_AS93_LEGACY") === "true";
+const LOG_IP_CHANGES = Deno.env.get("LOG_IP_CHANGES") === "true";
 
-let changeCount = 0;
-
-let supabase: ReturnType<typeof getSupabaseClient>;
 const logger = new Logger("[domain-updater]");
 
-// Fetch domain data from the DigitalOcean serverless endpoint
+type Sb = ReturnType<typeof getSupabaseClient>;
+
+// Per-request state. Avoids module-level mutables that would race under per_worker.
+interface Ctx {
+  sb: Sb;
+  domainId: string;
+  userId: string;
+  changes: number;
+}
+
+// Legacy path: fetch from the original DigitalOcean function. Opt-in only.
+async function fetchDomainDataRemote(domain: string) {
+  const response = await fetch(AS93_DOMAIN_INFO_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Basic ${AS93_DOMAIN_INFO_KEY}`,
+    },
+    body: JSON.stringify({ domain }),
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!response.ok) {
+    throw new Error(`Upstream returned ${response.status} for ${domain}`);
+  }
+  const data = await response.json();
+  return data?.body?.domainInfo ?? data?.domainInfo;
+}
+
+// Resolve domain info inline by default; opt-in to AS93 legacy via env var.
 async function fetchDomainData(domain: string) {
-  if (!AS93_DOMAIN_INFO_URL || !AS93_DOMAIN_INFO_KEY) {
-    throw new Error("Domain info keys are not configured");
+  if (USE_AS93_LEGACY && AS93_DOMAIN_INFO_URL && AS93_DOMAIN_INFO_KEY) {
+    return await fetchDomainDataRemote(domain);
   }
-
-  try {
-    const response = await fetch(AS93_DOMAIN_INFO_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Basic ${AS93_DOMAIN_INFO_KEY}`,
-      },
-      body: JSON.stringify({ domain }),
-    });
-
-    if (!response.ok) {
-      throw new Error(`Upstream API returned an error for ${domain}: ${response.statusText}`);
-    }
-
-    const data = await response.json();
-    return data.body.domainInfo;
-  } catch (error) {
-    logger.error(`Failed to fetch data for ${domain}: ${(error as Error).message}`);
-    throw error;
-  }
+  const { domainInfo } = await resolveDomainInfo(domain);
+  return domainInfo;
 }
 
-// Sanitize dates: convert empty/invalid to null for safe database storage
-const sanitizeDate = (d: string | null | undefined): string | null =>
-  (!d || d.trim() === "" || isNaN(new Date(d).getTime())) ? null : d;
+// Coerce any incoming date-ish value to a clean ISO string or null.
+const sanitizeDate = (d: unknown): string | null => {
+  if (d == null) return null;
+  const s = typeof d === "string" ? d : (d instanceof Date ? d.toISOString() : String(d));
+  if (!s.trim() || isNaN(new Date(s).getTime())) return null;
+  return s;
+};
 
-// Compare dates ignoring time and timezone
-function areDatesEqual(date1: string | null, date2: string | null): boolean {
-  if (!date1 || date1.trim() === "" || !date2 || date2.trim() === "") return false;
-  const d1 = new Date(date1), d2 = new Date(date2);
-  if (isNaN(d1.getTime()) || isNaN(d2.getTime())) return false;
-  return d1.toISOString().slice(0, 10) === d2.toISOString().slice(0, 10);
+// Compare dates ignoring time and timezone.
+function areDatesEqual(date1: unknown, date2: unknown): boolean {
+  const a = sanitizeDate(date1), b = sanitizeDate(date2);
+  if (!a || !b) return false;
+  return a.slice(0, 10) === b.slice(0, 10);
 }
 
-// Mapping for changeType to notification_type
+// Case-insensitive comparison for nullable string values.
+function isDifferent(v1: string | null | undefined, v2: string | null | undefined) {
+  return (v1?.toLowerCase() ?? "") !== (v2?.toLowerCase() ?? "");
+}
+
 const changeTypeToNotificationType: Record<string, string> = {
   registrar: "registrar",
   whois_organization: "whois_",
@@ -72,7 +86,6 @@ const changeTypeToNotificationType: Record<string, string> = {
   status: "status",
 };
 
-// Mapping for field names to human-readable names
 const fieldToHumanName: Record<string, string> = {
   registrar: "Registrar",
   whois_organization: "WHOIS Organization",
@@ -87,464 +100,332 @@ const fieldToHumanName: Record<string, string> = {
   status: "Domain Status",
 };
 
-// Function to check notification preferences and insert notification if enabled
-async function checkAndInsertNotification(
-  domainId: string,
-  userId: string,
-  changeType: string,
-  field: string,
-  oldValue: any,
-  newValue: any,
+// Insert a notification row when the user has the relevant preference enabled.
+async function maybeNotify(
+  ctx: Ctx, field: string, oldValue: any, newValue: any,
 ) {
-  // Map changeType to the relevant notification type
   const notificationType = changeTypeToNotificationType[field];
+  if (!notificationType) return;
 
-  if (!notificationType) {
-    logger.debug(`No notification type found for field "${field}"`);
-    return;
-  }
-
-  // Check if the notification type is enabled for this domain
-  const { data: preference, error } = await supabase
+  const { data: preference, error } = await ctx.sb
     .from("notification_preferences")
     .select("is_enabled")
-    .eq("domain_id", domainId)
+    .eq("domain_id", ctx.domainId)
     .eq("notification_type", notificationType)
     .maybeSingle();
-
   if (error) {
-    logger.error(`Failed to check notification preference for ${notificationType}: ${error.message}`);
+    logger.error(`Notification preference lookup failed: ${error.message}`);
     return;
   }
+  if (!preference?.is_enabled) return;
 
-  // If the notification is enabled, insert a new notification into the notifications table
-  const isEnabled = preference?.is_enabled ?? false;
-  if (!isEnabled) {
-    logger.debug(`Notifications for ${notificationType} are disabled`);
-    return;
-  }
-  const humanFieldName = fieldToHumanName[field] || field;
-  let message;
-  if (oldValue === null || oldValue === "Unknown") {
-    message = `${humanFieldName} was added "${newValue}"`;
-  } else if (newValue === null || newValue === "Unknown") {
-    message = `${humanFieldName} was removed "${oldValue}"`;
+  const human = fieldToHumanName[field] ?? field;
+  let message: string;
+  if (oldValue == null || oldValue === "Unknown") {
+    message = `${human} was added "${newValue}"`;
+  } else if (newValue == null || newValue === "Unknown") {
+    message = `${human} was removed "${oldValue}"`;
   } else {
-    message =
-      `The ${humanFieldName} for your domain has changed from "${oldValue}" to "${newValue}".`;
+    message = `The ${human} for your domain has changed from "${oldValue}" to "${newValue}".`;
   }
 
-  logger.debug(`Creating ${notificationType} notification: ${message}`);
-
-  const { data: _data, error: notificationInsertionError } = await supabase
-    .from("notifications")
-    .insert({
-      user_id: userId,
-      domain_id: domainId,
-      change_type: field,
-      message,
-      sent: false,
-      read: false,
-    });
-
-  if (notificationInsertionError) {
-    logger.error(`Failed to insert notification: ${notificationInsertionError.message}`);
-  }
+  const { error: insErr } = await ctx.sb.from("notifications").insert({
+    user_id: ctx.userId,
+    domain_id: ctx.domainId,
+    change_type: field,
+    message,
+    sent: false,
+    read: false,
+  });
+  if (insErr) logger.error(`Notification insert failed: ${insErr.message}`);
 }
 
-// Function to record domain change and trigger notification if applicable
-async function recordDomainChange(
-  domainId: string,
-  userId: string,
-  changeType: string,
-  field: string,
-  oldValue: any,
-  newValue: any,
+// Record a single domain change row plus optional notification.
+async function recordChange(
+  ctx: Ctx, changeType: string, field: string, oldValue: any, newValue: any,
 ) {
   if (newValue === "Unknown") return;
-  if ((oldValue || "").toLowerCase() === (newValue || "").toLowerCase()) return;
+  if ((oldValue || "").toString().toLowerCase()
+      === (newValue || "").toString().toLowerCase()) return;
   try {
-    logger.debug(`Change detected - ${field}: ${oldValue ?? "none"} → ${newValue ?? "none"} (${changeType})`);
-    changeCount++;
-
-    // Insert domain change into domain_updates
-    await supabase.from("domain_updates").insert({
-      domain_id: domainId,
-      user_id: userId,
+    logger.debug(
+      `Change ${field}: ${oldValue ?? "none"} → ${newValue ?? "none"} (${changeType})`,
+    );
+    ctx.changes++;
+    await ctx.sb.from("domain_updates").insert({
+      domain_id: ctx.domainId,
+      user_id: ctx.userId,
       change: field,
       change_type: changeType,
       old_value: oldValue,
       new_value: newValue,
       date: new Date(),
     });
-
-    // Call function to check notification preference and insert notification if enabled
-    await checkAndInsertNotification(
-      domainId,
-      userId,
-      changeType,
-      field,
-      oldValue,
-      newValue,
-    );
-  } catch (error) {
-    logger.error(`Failed to record change for ${field}: ${(error as Error).message}`);
+    await maybeNotify(ctx, field, oldValue, newValue);
+  } catch (err) {
+    logger.error(`Failed to record change for ${field}: ${(err as Error).message}`);
   }
 }
 
-// Case-insensitive comparison for string values
-function isDifferentCaseInsensitive(
-  value1: string | null,
-  value2: string | null,
-) {
-  return (value1?.toLowerCase() ?? "") !== (value2?.toLowerCase() ?? "");
+// Resolve registrar by name, inserting a new row if needed; returns id or null.
+async function resolveRegistrarId(ctx: Ctx, name: string, url: string | null) {
+  const { data: existing } = await ctx.sb.from("registrars")
+    .select("id").ilike("name", name).maybeSingle();
+  if (existing) return existing.id as string;
+  const { data: created, error } = await ctx.sb.from("registrars")
+    .insert({ name, url }).select("id").single();
+  if (error) {
+    logger.error(`Failed to insert registrar ${name}: ${error.message}`);
+    return null;
+  }
+  return created?.id as string ?? null;
 }
 
-// Update WHOIS information
-async function updateWhoisInfo(
-  domainId: string,
-  userId: string,
-  domainInfo: any,
-  currentDomain: any,
-) {
-  const whoisFields = [
-    { apiField: "name", dbField: "name" },
-    { apiField: "organization", dbField: "organization" },
-    { apiField: "state", dbField: "state" },
-    { apiField: "city", dbField: "city" },
-    { apiField: "country", dbField: "country" },
-    { apiField: "postal_code", dbField: "postal_code" },
-  ];
+// Update the registrar relation if the upstream name differs from current.
+async function syncRegistrar(ctx: Ctx, info: any, current: any) {
+  const newName = info.registrar?.name;
+  const currentName = current.registrars?.name ?? null;
+  if (!isDifferent(newName, currentName)) return;
+  await recordChange(ctx, "updated", "registrar", currentName, newName ?? null);
+  if (!newName) return;
+  const registrarId = await resolveRegistrarId(ctx, newName, info.registrar?.url ?? null);
+  if (registrarId) {
+    await ctx.sb.from("domains").update({ registrar_id: registrarId })
+      .eq("id", ctx.domainId);
+  }
+}
 
-  for (const { apiField, dbField } of whoisFields) {
-    if (
-      isDifferentCaseInsensitive(
-        domainInfo.whois[apiField],
-        currentDomain.whois_info[dbField],
-      )
-    ) {
-      await recordDomainChange(
-        domainId,
-        userId,
-        "updated",
-        `whois_${apiField}`,
-        currentDomain.whois_info[dbField],
-        domainInfo.whois[apiField],
+const WHOIS_FIELDS = [
+  "name", "organization", "state", "city", "country", "postal_code",
+] as const;
+
+// Diff WHOIS contact fields and write a SINGLE upsert with every changed field.
+async function syncWhois(ctx: Ctx, info: any, current: any) {
+  const incoming = info.whois ?? {};
+  const existing = current.whois_info ?? {};
+  const updates: Record<string, string> = {};
+
+  for (const field of WHOIS_FIELDS) {
+    const newValue = incoming[field];
+    if (!newValue) continue;
+    if (isDifferent(newValue, existing[field])) {
+      await recordChange(
+        ctx, "updated", `whois_${field}`, existing[field] ?? null, newValue,
       );
-      await supabase.from("whois_info").upsert({
-        domain_id: domainId,
-        [dbField]: domainInfo.whois[apiField],
-      });
+      updates[field] = newValue;
     }
   }
+
+  if (Object.keys(updates).length === 0) return;
+  const { error } = await ctx.sb.from("whois_info").upsert(
+    { domain_id: ctx.domainId, ...updates },
+    { onConflict: "domain_id" },
+  );
+  if (error) logger.error(`whois_info upsert failed: ${error.message}`);
 }
 
-// Update Domain Data
-async function updateDomainData(
-  domainId: string,
-  userId: string,
-  domainInfo: any,
-  currentDomain: any,
+// Sync a single DNS record set (NS/MX/TXT). Skips writes when upstream is empty.
+async function syncDnsRecordSet(ctx: Ctx, recordType: string, newRecords: string[]) {
+  const { data: currentRecords } = await ctx.sb.from("dns_records")
+    .select("*").eq("domain_id", ctx.domainId).eq("record_type", recordType);
+  const current = currentRecords ?? [];
+  if (!newRecords.length && current.length) return;
+
+  const lower = newRecords.map((r) => r.toLowerCase());
+  const added = lower.filter((r) =>
+    !current.some((cr) => cr.record_value.toLowerCase() === r)
+  );
+  const removed = current.filter((cr) =>
+    !lower.includes(cr.record_value.toLowerCase())
+  );
+  const tag = `dns_${recordType.toLowerCase()}`;
+
+  for (const value of added) {
+    await recordChange(ctx, "added", tag, null, value);
+    await ctx.sb.from("dns_records").insert({
+      domain_id: ctx.domainId, record_type: recordType, record_value: value,
+    });
+  }
+  for (const r of removed) {
+    await recordChange(ctx, "removed", tag, r.record_value, null);
+    await ctx.sb.from("dns_records").delete().eq("id", r.id);
+  }
+}
+
+async function syncDns(ctx: Ctx, info: any) {
+  const map: Record<string, string> = {
+    NS: "nameServers", TXT: "txtRecords", MX: "mxRecords",
+  };
+  for (const [recordType, key] of Object.entries(map)) {
+    const newRecords = (info.dns?.[key] ?? []) as string[];
+    await syncDnsRecordSet(ctx, recordType, newRecords);
+  }
+}
+
+// Sync IPs to match upstream. Round-robin DNS makes the change log noisy, so
+// add/remove events are suppressed unless LOG_IP_CHANGES=true.
+async function syncIpVersion(
+  ctx: Ctx, version: "ipv4" | "ipv6", newIps: string[],
 ) {
+  const { data: currentIps } = await ctx.sb.from("ip_addresses")
+    .select("*").eq("domain_id", ctx.domainId).eq("is_ipv6", version === "ipv6");
+  const current = currentIps ?? [];
+  if (!newIps.length && current.length) return;
+
+  const lower = newIps.map((ip) => ip.toLowerCase());
+  const added = lower.filter((ip) =>
+    !current.some((cip) => cip.ip_address.toLowerCase() === ip)
+  );
+  const removed = current.filter((cip) =>
+    !lower.includes(cip.ip_address.toLowerCase())
+  );
+  const tag = `ip_${version}`;
+
+  for (const value of added) {
+    if (LOG_IP_CHANGES) await recordChange(ctx, "added", tag, null, value);
+    await ctx.sb.from("ip_addresses").insert({
+      domain_id: ctx.domainId, ip_address: value, is_ipv6: version === "ipv6",
+    });
+  }
+  for (const r of removed) {
+    if (LOG_IP_CHANGES) await recordChange(ctx, "removed", tag, r.ip_address, null);
+    await ctx.sb.from("ip_addresses").delete().eq("id", r.id);
+  }
+}
+
+async function syncIps(ctx: Ctx, info: any) {
+  for (const v of ["ipv4", "ipv6"] as const) {
+    await syncIpVersion(ctx, v, info.ip_addresses?.[v] ?? []);
+  }
+}
+
+// Sync SSL cert fields, never nulling existing values when upstream is empty.
+async function syncSsl(ctx: Ctx, info: any, current: any) {
+  const existing = current.ssl_certificates?.[0] ?? null;
+  const issuer = info.ssl?.issuer ?? null;
+  const validFrom = sanitizeDate(info.ssl?.valid_from);
+  const validTo = sanitizeDate(info.ssl?.valid_to);
+  const hasNew = !!(issuer || validFrom || validTo);
+  if (!hasNew) return;
+
+  if (!existing) {
+    const { error } = await ctx.sb.from("ssl_certificates").insert({
+      domain_id: ctx.domainId,
+      issuer, valid_from: validFrom, valid_to: validTo,
+    });
+    if (error) logger.error(`ssl_certificates insert failed: ${error.message}`);
+    return;
+  }
+
+  const changed = isDifferent(issuer, existing.issuer)
+    || !areDatesEqual(validFrom, existing.valid_from)
+    || !areDatesEqual(validTo, existing.valid_to);
+  if (!changed) return;
+
+  await recordChange(ctx, "updated", "ssl_issuer", existing.issuer, issuer);
+  const { error } = await ctx.sb.from("ssl_certificates").update({
+    issuer: issuer ?? existing.issuer,
+    valid_from: validFrom ?? existing.valid_from,
+    valid_to: validTo ?? existing.valid_to,
+  }).eq("domain_id", ctx.domainId);
+  if (error) logger.error(`ssl_certificates update failed: ${error.message}`);
+}
+
+// Sync ICANN status codes; treats empty upstream as transient and skips writes.
+async function syncStatuses(ctx: Ctx, info: any) {
+  const newStatuses = (info.status ?? []).map((s: string) => s.toLowerCase());
+  const { data: currentStatuses } = await ctx.sb.from("domain_statuses")
+    .select("*").eq("domain_id", ctx.domainId);
+  const current = currentStatuses ?? [];
+  if (!newStatuses.length && current.length) return;
+
+  const added = newStatuses.filter((s: string) =>
+    !current.some((cs: any) => cs.status_code.toLowerCase() === s)
+  );
+  const removed = current.filter((cs: any) =>
+    !newStatuses.includes(cs.status_code.toLowerCase())
+  );
+
+  for (const value of added) {
+    await recordChange(ctx, "added", "status", null, value);
+    await ctx.sb.from("domain_statuses").insert({
+      domain_id: ctx.domainId, status_code: value,
+    });
+  }
+  for (const r of removed) {
+    await recordChange(ctx, "removed", "status", r.status_code, null);
+    await ctx.sb.from("domain_statuses").delete().eq("id", r.id);
+  }
+}
+
+// Sync expiry/updated dates. Never overwrite existing date with empty upstream.
+async function syncDates(ctx: Ctx, info: any, current: any) {
+  const newExpiry = sanitizeDate(info.dates?.expiry_date);
+  if (newExpiry && !areDatesEqual(newExpiry, current.expiry_date)) {
+    await recordChange(
+      ctx, "updated", "dates_expiry", current.expiry_date, newExpiry,
+    );
+    await ctx.sb.from("domains").update({ expiry_date: newExpiry })
+      .eq("id", ctx.domainId);
+  }
+  const newUpdated = sanitizeDate(info.dates?.updated_date);
+  if (newUpdated && !areDatesEqual(newUpdated, current.updated_date)) {
+    await recordChange(
+      ctx, "updated", "dates_updated", current.updated_date, newUpdated,
+    );
+    await ctx.sb.from("domains").update({ updated_date: newUpdated })
+      .eq("id", ctx.domainId);
+  }
+}
+
+// Run every sync step under a shared per-request context.
+async function syncDomain(ctx: Ctx, info: any, current: any) {
   try {
-    // 1. Registrar
-    if (
-      isDifferentCaseInsensitive(
-        domainInfo.registrar?.name,
-        currentDomain.registrars?.name,
-      )
-    ) {
-      await recordDomainChange(
-        domainId,
-        userId,
-        "updated",
-        "registrar",
-        currentDomain.registrars?.name ?? null,
-        domainInfo.registrar?.name ?? null,
-      );
-      if (domainInfo.registrar?.name) {
-        const { data: existingRegistrar } = await supabase.from("registrars")
-          .select("id").ilike("name", domainInfo.registrar.name).single();
-
-        if (existingRegistrar) {
-          await supabase.from("domains").update({
-            registrar_id: existingRegistrar.id,
-          }).eq("id", domainId);
-        } else {
-          const { data: newRegistrar } = await supabase
-            .from("registrars")
-            .insert({
-              name: domainInfo.registrar.name,
-              url: domainInfo.registrar.url,
-            })
-            .select("id")
-            .single();
-          if (newRegistrar) {
-            await supabase.from("domains").update({
-              registrar_id: newRegistrar.id,
-            }).eq("id", domainId);
-          }
-        }
-      }
-    }
-
-    // 2. WHOIS
-    await updateWhoisInfo(domainId, userId, domainInfo, currentDomain);
-
-    // 3. DNS Records (NS, TXT, MX)
-    const dnsRecordTypes = ["NS", "TXT", "MX"];
-    for (const recordType of dnsRecordTypes) {
-      const key =
-        { NS: "nameServers", TXT: "txtRecords", MX: "mxRecords" }[recordType] ||
-        "";
-      const newRecords = domainInfo.dns[key]?.map((r) => r.toLowerCase()) || [];
-      const { data: currentRecords } = await supabase.from("dns_records")
-        .select("*").eq("domain_id", domainId).eq("record_type", recordType);
-
-      const addedRecords = newRecords.filter((r) =>
-        !currentRecords.some((cr) => cr.record_value.toLowerCase() === r)
-      );
-      const removedRecords = currentRecords.filter((cr) =>
-        !newRecords.includes(cr.record_value.toLowerCase())
-      );
-
-      for (const added of addedRecords) {
-        await recordDomainChange(
-          domainId,
-          userId,
-          "added",
-          `dns_${recordType.toLowerCase()}`,
-          null,
-          added,
-        );
-        await supabase.from("dns_records").insert({
-          domain_id: domainId,
-          record_type: recordType,
-          record_value: added,
-        });
-      }
-      for (const removed of removedRecords) {
-        await recordDomainChange(
-          domainId,
-          userId,
-          "removed",
-          `dns_${recordType.toLowerCase()}`,
-          removed.record_value,
-          null,
-        );
-        await supabase.from("dns_records").delete().eq("id", removed.id);
-      }
-    }
-
-    // 4. IP Addresses
-    const ipVersions = ["ipv4", "ipv6"];
-    for (const version of ipVersions) {
-      const newIps = domainInfo.ip_addresses[version].map((ip: string) =>
-        ip.toLowerCase()
-      );
-      const { data: currentIps } = await supabase.from("ip_addresses").select(
-        "*",
-      ).eq("domain_id", domainId).eq("is_ipv6", version === "ipv6");
-
-      const addedIps = newIps.filter((ip) =>
-        !currentIps.some((cip) => cip.ip_address.toLowerCase() === ip)
-      );
-      const removedIps = currentIps.filter((cip) =>
-        !newIps.includes(cip.ip_address.toLowerCase())
-      );
-
-      for (const added of addedIps) {
-        await recordDomainChange(
-          domainId,
-          userId,
-          "added",
-          `ip_${version}`,
-          null,
-          added,
-        );
-        await supabase.from("ip_addresses").insert({
-          domain_id: domainId,
-          ip_address: added,
-          is_ipv6: version === "ipv6",
-        });
-      }
-      for (const removed of removedIps) {
-        await recordDomainChange(
-          domainId,
-          userId,
-          "removed",
-          `ip_${version}`,
-          removed.ip_address,
-          null,
-        );
-        await supabase.from("ip_addresses").delete().eq("id", removed.id);
-      }
-    }
-
-    // 5. SSL Certificate
-    const existingSsl =
-      (currentDomain.ssl_certificates && currentDomain.ssl_certificates.length)
-        ? currentDomain.ssl_certificates[0]
-        : null;
-    if (existingSsl) {
-      if (
-        isDifferentCaseInsensitive(domainInfo.ssl.issuer, existingSsl.issuer) ||
-        !areDatesEqual(domainInfo.ssl.valid_from, existingSsl.valid_from) ||
-        !areDatesEqual(domainInfo.ssl.valid_to, existingSsl.valid_to)
-      ) {
-        // Record any detected change
-        await recordDomainChange(
-          domainId,
-          userId,
-          "updated",
-          "ssl_issuer",
-          existingSsl.issuer,
-          domainInfo.ssl.issuer,
-        );
-
-        // Update the existing SSL certificate record
-        await supabase
-          .from("ssl_certificates")
-          .update({
-            issuer: domainInfo.ssl.issuer,
-            valid_from: sanitizeDate(domainInfo.ssl.valid_from),
-            valid_to: sanitizeDate(domainInfo.ssl.valid_to),
-          })
-          .eq("domain_id", domainId);
-      }
-    } else {
-      // No existing SSL record, so insert a new one
-      await supabase.from("ssl_certificates").insert({
-        domain_id: domainId,
-        issuer: domainInfo.ssl.issuer,
-        valid_from: sanitizeDate(domainInfo.ssl.valid_from),
-        valid_to: sanitizeDate(domainInfo.ssl.valid_to),
-      });
-    }
-
-    // 6. Status Codes
-    const newStatuses = domainInfo.status.map((s: string) => s.toLowerCase());
-
-    if (!newStatuses || !newStatuses.length) {
-      const { data: currentStatuses } = await supabase.from("domain_statuses")
-        .select("*").eq("domain_id", domainId);
-
-      const addedStatuses = newStatuses.filter((s: string) =>
-        !currentStatuses.some((cs: any) => cs.status_code.toLowerCase() === s)
-      );
-      const removedStatuses = currentStatuses.filter((
-        cs: { status_code: string },
-      ) => !newStatuses.includes(cs.status_code.toLowerCase()));
-
-      for (const added of addedStatuses) {
-        await recordDomainChange(
-          domainId,
-          userId,
-          "added",
-          "status",
-          null,
-          added,
-        );
-        await supabase.from("domain_statuses").insert({
-          domain_id: domainId,
-          status_code: added,
-        });
-      }
-      for (const removed of removedStatuses) {
-        await recordDomainChange(
-          domainId,
-          userId,
-          "removed",
-          "status",
-          removed.status_code,
-          null,
-        );
-        await supabase.from("domain_statuses").delete().eq("id", removed.id);
-      }
-    }
-
-    // 7. Dates
-    const newExpiry = sanitizeDate(domainInfo.dates.expiry_date);
-    if (newExpiry && !areDatesEqual(newExpiry, currentDomain.expiry_date)) {
-      await recordDomainChange(
-        domainId,
-        userId,
-        "updated",
-        "dates_expiry",
-        currentDomain.expiry_date,
-        newExpiry,
-      );
-      await supabase.from("domains").update({
-        expiry_date: newExpiry,
-      }).eq("id", domainId);
-    }
-    const newUpdated = sanitizeDate(domainInfo.dates.updated_date);
-    if (newUpdated && !areDatesEqual(newUpdated, currentDomain.updated_date)) {
-      await recordDomainChange(
-        domainId,
-        userId,
-        "updated",
-        "dates_updated",
-        currentDomain.updated_date,
-        newUpdated,
-      );
-      await supabase.from("domains").update({
-        updated_date: newUpdated,
-      }).eq("id", domainId);
-    }
-  } catch (error) {
-    logger.error(`Failed to update domain data for ${currentDomain.domain_name}: ${(error as Error).message}`);
+    await syncRegistrar(ctx, info, current);
+    await syncWhois(ctx, info, current);
+    await syncDns(ctx, info);
+    await syncIps(ctx, info);
+    await syncSsl(ctx, info, current);
+    await syncStatuses(ctx, info);
+    await syncDates(ctx, info, current);
+  } catch (err) {
+    logger.error(
+      `Failed to sync ${current.domain_name}: ${(err as Error).message}`,
+    );
   }
 }
 
-// Serve function for Supabase
+const jsonResp = (body: unknown, status: number) =>
+  new Response(JSON.stringify(body), {
+    status, headers: { "Content-Type": "application/json" },
+  });
+
 serve(async (req) => {
-  supabase = getSupabaseClient(req);
-
-  let domain = "";
-  let user_id = "";
-
-  // Check this is the right request method
   if (req.method !== "POST") {
-    return new Response(
-      JSON.stringify({ message: "❌ Invalid request method" }),
-      { status: 405 },
-    );
+    return jsonResp({ message: "❌ Invalid request method" }, 405);
   }
-  // Check we can read the request body, and set domain + user_id
+  const sb = getSupabaseClient(req);
+
+  let domain = "", user_id = "";
   try {
     const body = await req.json();
     domain = body.domain;
     user_id = body.user_id;
-  } catch (error) {
-    logger.error(`Failed to parse request body: ${(error as Error).message}`);
-    return new Response(
-      JSON.stringify({ message: "❌ Invalid request body" }),
-      { status: 400 },
-    );
+  } catch (err) {
+    logger.error(`Failed to parse request body: ${(err as Error).message}`);
+    return jsonResp({ message: "❌ Invalid request body" }, 400);
   }
-
-  // Check we have a non-empty domain and user_id
   if (!domain || !user_id) {
-    return new Response(
-      JSON.stringify({
-        message: "❌ Domain could not be updated",
-        error: "Missing params, domain and/or user_id",
-      }),
-      {
-        status: 500,
-        headers: { "Content-Type": "application/json" },
-      },
-    );
+    return jsonResp({
+      message: "❌ Domain could not be updated",
+      error: "Missing params, domain and/or user_id",
+    }, 400);
   }
 
   try {
     logger.info(`Processing update for ${domain}`);
-
-    // Fetch the latest domain info
     const newDomainInfo = await fetchDomainData(domain);
-    // Fetch the current domain data
-    const { data: currentDomainRecord, error } = await supabase
+    const { data: currentDomainRecord, error } = await sb
       .from("domains")
       .select(`
         *,
@@ -561,55 +442,43 @@ serve(async (req) => {
 
     if (error) {
       logger.error(`Failed to fetch domain record for ${domain}: ${error.message}`);
-      return new Response(
-        JSON.stringify({
-          message: "❌ Error fetching domain record",
-          error: error.message,
-        }),
-        { status: 500 },
-      );
+      return jsonResp({
+        message: "❌ Error fetching domain record", error: error.message,
+      }, 500);
     }
-
     if (!currentDomainRecord) {
       logger.warn(`Domain ${domain} not found for user ${user_id}`);
-      return new Response(
-        JSON.stringify({ message: "❌ Domain not found for user" }),
-        { status: 404 },
-      );
+      return jsonResp({ message: "❌ Domain not found for user" }, 404);
     }
 
-    // Trigger an update and comparison of domain data
-    await updateDomainData(
-      currentDomainRecord.id,
-      user_id,
-      newDomainInfo,
-      currentDomainRecord,
+    // Bail out cleanly when upstream returned nothing useful, so we never
+    // overwrite good data with a transient empty resolution.
+    const hasAnySignal = !!(
+      newDomainInfo?.dates?.expiry_date ||
+      newDomainInfo?.dates?.creation_date ||
+      newDomainInfo?.registrar?.name ||
+      newDomainInfo?.ip_addresses?.ipv4?.length ||
+      newDomainInfo?.dns?.nameServers?.length
     );
+    if (!hasAnySignal) {
+      logger.warn(`No usable data resolved for ${domain}, skipping update`);
+      return jsonResp({ message: `⚠️ ${domain} resolved no data, skipped` }, 200);
+    }
 
-    logger.success(`${domain} updated successfully: ${changeCount} change(s)`);
-    return new Response(
-      JSON.stringify({
-        message: `✅ ${domain} updates successfully: ${changeCount} changes.`,
-      }),
-      {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      },
-    );
-  } catch (error) {
-    const errorMessage = error instanceof Error
-      ? error.message
-      : "Unknown error";
-    logger.error(`Failed to update ${domain}: ${errorMessage}`);
-    return new Response(
-      JSON.stringify({
-        message: `⚠️ ${domain} could not be updated`,
-        error: errorMessage,
-      }),
-      {
-        status: 500,
-        headers: { "Content-Type": "application/json" },
-      },
-    );
+    const ctx: Ctx = {
+      sb, domainId: currentDomainRecord.id, userId: user_id, changes: 0,
+    };
+    await syncDomain(ctx, newDomainInfo, currentDomainRecord);
+
+    logger.success(`${domain} updated: ${ctx.changes} change(s)`);
+    return jsonResp({
+      message: `✅ ${domain} updated successfully: ${ctx.changes} changes.`,
+    }, 200);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Unknown error";
+    logger.error(`Failed to update ${domain}: ${msg}`);
+    return jsonResp({
+      message: `⚠️ ${domain} could not be updated`, error: msg,
+    }, 500);
   }
 });

@@ -34,6 +34,7 @@ async function updateDomainForUser(
         ...(jwt ? { Authorization: `Bearer ${jwt}` } : {}),
       },
       body: JSON.stringify({ domain, user_id: userId }),
+      signal: AbortSignal.timeout(45_000),
     });
 
     const responseBody = await response.json();
@@ -49,12 +50,22 @@ async function updateDomainForUser(
   }
 }
 
-// Main function to fetch all domains and update each domain for its user
-async function processAllDomains(req: any) {
+const BATCH_SIZE = Number(Deno.env.get("TRIGGER_UPDATES_BATCH_SIZE") ?? 10);
+
+// Process a batch of domains concurrently, bounded by BATCH_SIZE.
+async function processBatch(
+  batch: { domain_name: string; user_id: string }[],
+  req: Request,
+) {
+  await Promise.allSettled(
+    batch.map((d) => updateDomainForUser(d.domain_name, d.user_id, req)),
+  );
+}
+
+// Process every domain in batches; parallel within a batch, sequential between.
+async function processAllDomains(req: Request) {
   const supabase = getSupabaseClient(req);
-  // Start time
   const startTime = performance.now();
-  // Fetch all user_id and domain_name pairs from the domains table
   const { data: domains, error } = await supabase
     .from("domains")
     .select("user_id, domain_name");
@@ -64,15 +75,12 @@ async function processAllDomains(req: any) {
     throw new Error("Error fetching domains");
   }
 
-  // Call the domain-updater function for each (user_id, domain_name) pair
-  for (const domain of domains) {
-    await updateDomainForUser(domain.domain_name, domain.user_id, req);
+  for (let i = 0; i < domains.length; i += BATCH_SIZE) {
+    await processBatch(domains.slice(i, i + BATCH_SIZE), req);
   }
 
-  const processedCount = domains.length;
-  const endTime = performance.now();
-  const duration = ((endTime - startTime) / 1000).toFixed(1);
-  return `✅ ${processedCount} domains processed successfully in ${duration} seconds`;
+  const duration = ((performance.now() - startTime) / 1000).toFixed(1);
+  return `✅ ${domains.length} domains processed successfully in ${duration} seconds`;
 }
 
 // Supabase serverless function handler
