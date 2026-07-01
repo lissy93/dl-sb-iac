@@ -47,7 +47,7 @@ jobs:
       - name: 🔧 Push Config to Supabase
         run: |
           cp "$CONFIG_FILE" supabase/config.toml
-          supabase config push
+          supabase config push --yes
 
       - name: 🗃️ Apply DB Migrations
         run: yes | supabase db push

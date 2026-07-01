@@ -7,15 +7,15 @@ all: deploy
 
 seed:
 	@echo "🌱 Seeding database"
-	@$(SUPABASE) db seed || echo "No seed file found, skipping..."
+	@$(SUPABASE) seed buckets || echo "No buckets to seed, skipping..."
 
 secrets:
 	@echo "🔐 Setting secrets"
-	@$(SUPABASE) secrets set --env-file .env
+	@test -f .env && $(SUPABASE) secrets set --env-file .env || echo "No .env file found, skipping..."
 
 config:
 	@echo "⚙️ Applying configuration"
-	@$(SUPABASE) config push
+	@$(SUPABASE) config push --yes
 
 schema:
 	@echo "🚀 Deploying database schema"
