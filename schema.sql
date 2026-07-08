@@ -96,7 +96,25 @@ CREATE EXTENSION IF NOT EXISTS "wrappers" WITH SCHEMA "extensions";
 CREATE OR REPLACE FUNCTION "public"."delete_domain"("domain_id" "uuid") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
-    AS $_$BEGIN
+    AS $_$
+DECLARE
+  domain_owner uuid;
+  caller_role text :=
+    nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role';
+BEGIN
+  SELECT d.user_id INTO domain_owner FROM domains d WHERE d.id = $1;
+  IF domain_owner IS NULL THEN
+    RETURN;
+  END IF;
+
+  -- API callers must be the owner or the service role. Direct DB sessions
+  -- (no JWT claims) are already privileged and pass through.
+  IF caller_role IS NOT NULL AND caller_role <> 'service_role'
+     AND domain_owner IS DISTINCT FROM auth.uid() THEN
+    RAISE EXCEPTION 'Not authorised to delete domain %', $1
+      USING ERRCODE = '42501';
+  END IF;
+
   -- Delete related records
   DELETE FROM notifications WHERE notifications.domain_id = $1;
   DELETE FROM ip_addresses WHERE ip_addresses.domain_id = $1;
@@ -111,11 +129,19 @@ CREATE OR REPLACE FUNCTION "public"."delete_domain"("domain_id" "uuid") RETURNS 
 
   -- Delete the domain itself
   DELETE FROM domains WHERE domains.id = $1;
-  
-  -- Clean up orphaned records
-  DELETE FROM tags WHERE tags.id NOT IN (SELECT DISTINCT tag_id FROM domain_tags);
-  DELETE FROM hosts WHERE hosts.id NOT IN (SELECT DISTINCT host_id FROM domain_hosts);
-  DELETE FROM registrars WHERE registrars.id NOT IN (SELECT DISTINCT registrar_id FROM domains);
+
+  -- Clean up the owner's now-orphaned records. NOT EXISTS (never NOT IN) so
+  -- null FKs cannot turn these into no-ops, and rows still referenced by any
+  -- domain are always kept.
+  DELETE FROM tags t
+   WHERE t.user_id = domain_owner
+     AND NOT EXISTS (SELECT 1 FROM domain_tags dt WHERE dt.tag_id = t.id);
+  DELETE FROM hosts h
+   WHERE h.user_id = domain_owner
+     AND NOT EXISTS (SELECT 1 FROM domain_hosts dh WHERE dh.host_id = h.id);
+  DELETE FROM registrars r
+   WHERE r.user_id = domain_owner
+     AND NOT EXISTS (SELECT 1 FROM domains d WHERE d.registrar_id = r.id);
 
   RETURN;
 END;$_$;
@@ -1648,7 +1674,7 @@ GRANT USAGE ON SCHEMA "public" TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."delete_domain"("domain_id" "uuid") TO "anon";
+REVOKE ALL ON FUNCTION "public"."delete_domain"("domain_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."delete_domain"("domain_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."delete_domain"("domain_id" "uuid") TO "service_role";
 

@@ -8,7 +8,11 @@ import { serve } from "../shared/serveWithCors.ts";
 import { getSupabaseClient } from "../shared/supabaseClient.ts";
 import { Logger } from "../shared/logger.ts";
 import { resolveDomainInfo } from "../shared/domainResolver.ts";
-import { dateChangedBeyond, toIsoDate as sanitizeDate } from "../shared/whois.ts";
+import {
+  dateChangedBeyond,
+  isRedacted,
+  toIsoDate as sanitizeDate,
+} from "../shared/whois.ts";
 
 const AS93_DOMAIN_INFO_URL = Deno.env.get("AS93_DOMAIN_INFO_URL") ?? "";
 const AS93_DOMAIN_INFO_KEY = Deno.env.get("AS93_DOMAIN_INFO_KEY") ?? "";
@@ -261,7 +265,7 @@ async function syncWhois(ctx: Ctx, info: any, current: any) {
 
   for (const field of WHOIS_FIELDS) {
     const newValue = incoming[field];
-    if (isSentinel(newValue)) continue;
+    if (isSentinel(newValue) || isRedacted(newValue)) continue;
     if (isDifferent(newValue, existing[field])) {
       await recordChange(
         ctx,

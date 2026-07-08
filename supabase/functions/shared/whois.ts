@@ -307,6 +307,40 @@ function cleanStr(v: unknown): string | null {
   return s;
 }
 
+// Privacy-redaction phrases registries/registrars emit in place of withheld
+// registrant data. Sources word these differently, so left as-is they look
+// like real values that "change" whenever a different source answers.
+const REDACTION_RE = new RegExp(
+  "redacted|privacy|private person|by proxy|proxy protect|whoisguard|" +
+    "withheld|not disclosed|gdpr|data protected|statutory mask|" +
+    "obfuscated|non-?public|identity protect",
+  "i",
+);
+
+// True when a value is a privacy-redaction placeholder rather than real data.
+export function isRedacted(v: unknown): boolean {
+  return typeof v === "string" && REDACTION_RE.test(v);
+}
+
+// cleanStr plus redaction nulling, for registrant contact fields only.
+function cleanContact(v: unknown): string | null {
+  const s = cleanStr(v);
+  return s && REDACTION_RE.test(s) ? null : s;
+}
+
+// Normalise a whole contact block so redacted placeholders become nulls.
+function cleanContactBlock(c: WhoisContact): WhoisContact {
+  return {
+    name: cleanContact(c.name),
+    organization: cleanContact(c.organization),
+    street: cleanContact(c.street),
+    city: cleanContact(c.city),
+    state: cleanContact(c.state),
+    country: cleanContact(c.country),
+    postal_code: cleanContact(c.postal_code),
+  };
+}
+
 // Look up a value by trying any of the candidate keys in order.
 function pick(
   data: Record<string, string[]>,
@@ -375,7 +409,7 @@ function whoisDataToResult(
       url: pick(data, "registrar_url", "url", "registrar_whois_server"),
       registryDomainId: pick(data, "registry_domain_id"),
     },
-    whois: {
+    whois: cleanContactBlock({
       name: pick(data, "registrant_name"),
       organization: pick(
         data,
@@ -387,7 +421,7 @@ function whoisDataToResult(
       state: pick(data, "registrant_state_province", "registrant_state"),
       country: pick(data, "registrant_country", "registrant_country_code"),
       postal_code: pick(data, "registrant_postal_code", "registrant_post_code"),
-    },
+    }),
     abuse: {
       email: pick(
         data,
@@ -459,10 +493,17 @@ async function tryPort43(domain: string): Promise<WhoisResult | null> {
 // first (authoritative) source so output is deterministic even when the
 // registrar-level referral times out or returns slightly different values.
 // Contact and abuse fields prefer the second source since registries usually
-// do not carry them.
-function mergeResults(a: WhoisResult, b: WhoisResult): WhoisResult {
+// do not carry them; pass fillOnly to keep the first source authoritative for
+// every field (used when combining independent sources in priority order).
+function mergeResults(
+  a: WhoisResult,
+  b: WhoisResult,
+  fillOnly = false,
+): WhoisResult {
   const preferA = <T>(x: T | null | undefined, y: T | null | undefined) => x ?? y ?? null;
-  const preferB = <T>(x: T | null | undefined, y: T | null | undefined) => y ?? x ?? null;
+  const preferB = fillOnly
+    ? preferA
+    : <T>(x: T | null | undefined, y: T | null | undefined) => y ?? x ?? null;
   return {
     domainName: a.domainName ?? b.domainName,
     status: a.status.length ? a.status : b.status,
@@ -589,7 +630,7 @@ async function tryRdap(domain: string): Promise<WhoisResult | null> {
         url: regLink("about") ?? regLink("self"),
         registryDomainId: json.handle ?? null,
       },
-      whois: {
+      whois: cleanContactBlock({
         name: vcardValue(registrant?.vcardArray, "fn"),
         organization: vcardValue(registrant?.vcardArray, "org"),
         street: vcardValue(registrant?.vcardArray, "street"),
@@ -597,7 +638,7 @@ async function tryRdap(domain: string): Promise<WhoisResult | null> {
         state: vcardValue(registrant?.vcardArray, "region"),
         country: vcardValue(registrant?.vcardArray, "country-name"),
         postal_code: vcardValue(registrant?.vcardArray, "postal-code"),
-      },
+      }),
       abuse: {
         email: vcardValue(abuse?.vcardArray, "email"),
         phone: stripTel(phone),
@@ -624,15 +665,15 @@ interface WhoDatContact {
 // Map a who-dat contact block into our WhoisContact shape.
 function whoDatContact(c: WhoDatContact | null | undefined): WhoisContact {
   const a = c?.address;
-  return {
-    name: cleanStr(c?.name),
-    organization: cleanStr(c?.organization),
-    street: cleanStr(a?.street),
-    city: cleanStr(a?.city),
-    state: cleanStr(a?.state),
-    country: cleanStr(a?.country),
-    postal_code: cleanStr(a?.postalCode),
-  };
+  return cleanContactBlock({
+    name: c?.name,
+    organization: c?.organization,
+    street: a?.street,
+    city: a?.city,
+    state: a?.state,
+    country: a?.country,
+    postal_code: a?.postalCode,
+  });
 }
 
 // Fallback path: who-dat RDAP/WHOIS aggregator. The x-api-key header is sent only
@@ -719,15 +760,15 @@ async function tryWhoisXml(domain: string): Promise<WhoisResult | null> {
         url: whoisServer ? `https://${whoisServer}` : null,
         registryDomainId: cleanStr(reg.registryDomainId),
       },
-      whois: {
-        name: r.name ?? null,
-        organization: r.organization ?? null,
-        street: r.street1 ?? null,
-        city: r.city ?? null,
-        state: r.state ?? null,
-        country: r.countryCode ?? r.country ?? null,
-        postal_code: r.postalCode ?? null,
-      },
+      whois: cleanContactBlock({
+        name: r.name,
+        organization: r.organization,
+        street: r.street1,
+        city: r.city,
+        state: r.state,
+        country: r.countryCode ?? r.country,
+        postal_code: r.postalCode,
+      }),
       abuse: {
         email: rec.contactEmail ?? null,
         phone: null,
@@ -762,8 +803,8 @@ export async function getWhoisInfo(
       const result = await fn();
       if (hasUsefulData(result)) {
         log.success(`WHOIS via ${name} for ${trimmed}`);
-        if (!best) best = result;
-        else best = mergeResults(best, result!);
+        // Fill-only merge to keep the fixed source priority authoritative for all fields
+        best = best ? mergeResults(best, result, true) : result;
         if (best.dates.expiry_date && best.registrar.name) return best;
       }
     } catch (err) {

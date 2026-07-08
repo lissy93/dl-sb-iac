@@ -26,6 +26,19 @@ import { sendWhatsAppNotification } from "./senders/whatsapp.ts";
 const logger = new Logger("send-notification");
 const monitor = new Monitor("send-notification");
 
+type Sb = ReturnType<typeof getSupabaseClient>;
+
+// Resolve the user's account email via the auth admin API
+// Only possible when called with service-role since user JWT can't see emails
+async function getAccountEmail(sb: Sb, userId: string): Promise<string | null> {
+  const { data, error } = await sb.auth.admin.getUserById(userId);
+  if (error) {
+    logger.warn(`Account email lookup failed for ${userId}: ${error.message}`);
+    return null;
+  }
+  return data?.user?.email ?? null;
+}
+
 // Function entry point
 serve(async (req) => {
   await monitor.start();
@@ -65,22 +78,21 @@ serve(async (req) => {
       );
     }
 
-    // Get notification preferences
+    // Get notification preferences; a missing row means "never configured"
+    // and falls back to the account email below.
     const { data: userInfo, error: userError } = await supabase
       .from("user_info")
       .select("notification_channels")
       .eq("user_id", userId)
       .maybeSingle();
 
-    if (userError || !userInfo) {
+    if (userError) {
       logger.error(
-        `User not found or error fetching preferences for ${userId}`,
+        `Error fetching preferences for ${userId}: ${userError.message}`,
       );
       return new Response(
-        JSON.stringify({
-          error: "User not found or error fetching preferences",
-        }),
-        { status: 404, headers: { "Content-Type": "application/json" } },
+        JSON.stringify({ error: "Error fetching notification preferences" }),
+        { status: 500, headers: { "Content-Type": "application/json" } },
       );
     }
 
@@ -92,7 +104,7 @@ serve(async (req) => {
       .maybeSingle();
 
     // Get notification channels from user info
-    const rawChannels = userInfo.notification_channels || {};
+    const rawChannels = userInfo?.notification_channels || {};
 
     // If user is on a free plan, restrict notification channels to just email
     if (billingData?.current_plan === "free") {
@@ -101,7 +113,25 @@ serve(async (req) => {
       });
     }
 
-    const prefs = rawChannels as NotificationPreferences;
+    let prefs = rawChannels as NotificationPreferences;
+
+    // Fallback: with no usable channel configured, notify the account email
+    // so alerts still reach users who never set up preferences.
+    if (Object.keys(prefs).length === 0) {
+      const address = await getAccountEmail(supabase, userId);
+      if (!address) {
+        const msg = `No notification channels or account email for ${userId}`;
+        logger.warn(msg);
+        await logger.flushToRemote();
+        await monitor.success(msg);
+        return new Response(JSON.stringify({ message: msg }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      prefs = { email: { enabled: true, address } };
+    } else if (prefs.email?.enabled && !prefs.email.address) {
+      prefs.email.address = await getAccountEmail(supabase, userId) ?? "";
+    }
 
     // Dispatch each enabled notification channel
     const sendOps: Promise<void>[] = [];
