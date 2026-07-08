@@ -73,6 +73,39 @@ function isDifferent(v1: string | null | undefined, v2: string | null | undefine
   return (v1?.toLowerCase() ?? "") !== (v2?.toLowerCase() ?? "");
 }
 
+const SENTINELS = new Set(["", "unknown", "data redacted", "n/a"]);
+const isSentinel = (v: unknown) =>
+  v == null || (typeof v === "string" && SENTINELS.has(v.trim().toLowerCase()));
+
+// Normalize for fair equality: case, whitespace, punctuation, registrar [Tag] suffix.
+function normalizeForCompare(field: string, value: string): string {
+  const s = field === "registrar" ? value.replace(/\s*\[[^\]]*\]\s*$/, "") : value;
+  return s.trim().toLowerCase().replace(/[\s,.\-]+/g, "");
+}
+
+// Sub-2-day date diffs count as equivalent, to ignore WHOIS timestamp jitter.
+function datesEquivalent(oldV: unknown, newV: unknown): boolean {
+  const a = sanitizeDate(oldV), b = sanitizeDate(newV);
+  if (!a || !b) return false;
+  return Math.abs(new Date(b).getTime() - new Date(a).getTime()) < 2 * 86_400_000;
+}
+
+// Filter that decides whether to record a change in domain_updates. DB writes
+// are unaffected: the database always reflects the latest upstream truth.
+function isMeaningfulChange(
+  changeType: string, field: string, oldV: unknown, newV: unknown,
+): boolean {
+  // Removals clear a value (newV is always null), so gauge them by the old value.
+  if (changeType === "removed") return !isSentinel(oldV);
+  if (isSentinel(newV)) return false;
+  if (field.startsWith("dates_") && datesEquivalent(oldV, newV)) return false;
+  if (typeof oldV === "string" && typeof newV === "string"
+      && normalizeForCompare(field, oldV) === normalizeForCompare(field, newV)) {
+    return false;
+  }
+  return (oldV ?? "").toString().toLowerCase() !== (newV ?? "").toString().toLowerCase();
+}
+
 const changeTypeToNotificationType: Record<string, string> = {
   registrar: "registrar",
   whois_organization: "whois_",
@@ -144,9 +177,7 @@ async function maybeNotify(
 async function recordChange(
   ctx: Ctx, changeType: string, field: string, oldValue: any, newValue: any,
 ) {
-  if (newValue === "Unknown") return;
-  if ((oldValue || "").toString().toLowerCase()
-      === (newValue || "").toString().toLowerCase()) return;
+  if (!isMeaningfulChange(changeType, field, oldValue, newValue)) return;
   try {
     logger.debug(
       `Change ${field}: ${oldValue ?? "none"} → ${newValue ?? "none"} (${changeType})`,
@@ -181,13 +212,21 @@ async function resolveRegistrarId(ctx: Ctx, name: string, url: string | null) {
   return created?.id as string ?? null;
 }
 
-// Update the registrar relation if the upstream name differs from current.
+// True when the incoming registrar is a genuinely different entity, ignoring
+// formatting so near-identical names do not churn registrar_id.
+function registrarChanged(currentName: string | null, newName: unknown): boolean {
+  if (isSentinel(newName)) return false;
+  if (isSentinel(currentName)) return true;
+  return normalizeForCompare("registrar", currentName as string)
+    !== normalizeForCompare("registrar", newName as string);
+}
+
+// Update the registrar relation when the upstream names a different registrar.
 async function syncRegistrar(ctx: Ctx, info: any, current: any) {
   const newName = info.registrar?.name;
   const currentName = current.registrars?.name ?? null;
-  if (!isDifferent(newName, currentName)) return;
-  await recordChange(ctx, "updated", "registrar", currentName, newName ?? null);
-  if (!newName) return;
+  if (!registrarChanged(currentName, newName)) return;
+  await recordChange(ctx, "updated", "registrar", currentName, newName);
   const registrarId = await resolveRegistrarId(ctx, newName, info.registrar?.url ?? null);
   if (registrarId) {
     await ctx.sb.from("domains").update({ registrar_id: registrarId })
@@ -207,7 +246,7 @@ async function syncWhois(ctx: Ctx, info: any, current: any) {
 
   for (const field of WHOIS_FIELDS) {
     const newValue = incoming[field];
-    if (!newValue) continue;
+    if (isSentinel(newValue)) continue;
     if (isDifferent(newValue, existing[field])) {
       await recordChange(
         ctx, "updated", `whois_${field}`, existing[field] ?? null, newValue,
@@ -358,7 +397,8 @@ async function syncStatuses(ctx: Ctx, info: any) {
   }
 }
 
-// Sync expiry/updated dates. Never overwrite existing date with empty upstream.
+// Sync expiry/updated dates; backfill registration_date once when null.
+// Never overwrite existing data with empty upstream.
 async function syncDates(ctx: Ctx, info: any, current: any) {
   const newExpiry = sanitizeDate(info.dates?.expiry_date);
   if (newExpiry && !areDatesEqual(newExpiry, current.expiry_date)) {
@@ -369,12 +409,26 @@ async function syncDates(ctx: Ctx, info: any, current: any) {
       .eq("id", ctx.domainId);
   }
   const newUpdated = sanitizeDate(info.dates?.updated_date);
-  if (newUpdated && !areDatesEqual(newUpdated, current.updated_date)) {
+  const curUpdated = sanitizeDate(current.updated_date);
+  // Only advance updated_date; never regress it to an older upstream value.
+  if (newUpdated && (!curUpdated ||
+      new Date(newUpdated).getTime() > new Date(curUpdated).getTime())) {
     await recordChange(
       ctx, "updated", "dates_updated", current.updated_date, newUpdated,
     );
     await ctx.sb.from("domains").update({ updated_date: newUpdated })
       .eq("id", ctx.domainId);
+  }
+  if (!current.registration_date) {
+    const newCreation = sanitizeDate(info.dates?.creation_date);
+    if (newCreation) {
+      await recordChange(
+        ctx, "added", "dates_registration", null, newCreation,
+      );
+      await ctx.sb.from("domains").update({ registration_date: newCreation })
+        .eq("id", ctx.domainId)
+        .is("registration_date", null);
+    }
   }
 }
 
