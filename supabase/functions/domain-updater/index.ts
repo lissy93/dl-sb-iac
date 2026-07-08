@@ -8,6 +8,7 @@ import { serve } from "../shared/serveWithCors.ts";
 import { getSupabaseClient } from "../shared/supabaseClient.ts";
 import { Logger } from "../shared/logger.ts";
 import { resolveDomainInfo } from "../shared/domainResolver.ts";
+import { dateChangedBeyond, toIsoDate as sanitizeDate } from "../shared/whois.ts";
 
 const AS93_DOMAIN_INFO_URL = Deno.env.get("AS93_DOMAIN_INFO_URL") ?? "";
 const AS93_DOMAIN_INFO_KEY = Deno.env.get("AS93_DOMAIN_INFO_KEY") ?? "";
@@ -53,14 +54,6 @@ async function fetchDomainData(domain: string) {
   return domainInfo;
 }
 
-// Coerce any incoming date-ish value to a clean ISO string or null.
-const sanitizeDate = (d: unknown): string | null => {
-  if (d == null) return null;
-  const s = typeof d === "string" ? d : (d instanceof Date ? d.toISOString() : String(d));
-  if (!s.trim() || isNaN(new Date(s).getTime())) return null;
-  return s;
-};
-
 // Compare dates ignoring time and timezone.
 function areDatesEqual(date1: unknown, date2: unknown): boolean {
   const a = sanitizeDate(date1), b = sanitizeDate(date2);
@@ -69,11 +62,14 @@ function areDatesEqual(date1: unknown, date2: unknown): boolean {
 }
 
 // Case-insensitive comparison for nullable string values.
-function isDifferent(v1: string | null | undefined, v2: string | null | undefined) {
+function isDifferent(
+  v1: string | null | undefined,
+  v2: string | null | undefined,
+) {
   return (v1?.toLowerCase() ?? "") !== (v2?.toLowerCase() ?? "");
 }
 
-const SENTINELS = new Set(["", "unknown", "data redacted", "n/a"]);
+const SENTINELS = new Set(["", "unknown", "data redacted", "n/a", "none", "null"]);
 const isSentinel = (v: unknown) =>
   v == null || (typeof v === "string" && SENTINELS.has(v.trim().toLowerCase()));
 
@@ -83,27 +79,25 @@ function normalizeForCompare(field: string, value: string): string {
   return s.trim().toLowerCase().replace(/[\s,.\-]+/g, "");
 }
 
-// Sub-2-day date diffs count as equivalent, to ignore WHOIS timestamp jitter.
-function datesEquivalent(oldV: unknown, newV: unknown): boolean {
-  const a = sanitizeDate(oldV), b = sanitizeDate(newV);
-  if (!a || !b) return false;
-  return Math.abs(new Date(b).getTime() - new Date(a).getTime()) < 2 * 86_400_000;
-}
-
-// Filter that decides whether to record a change in domain_updates. DB writes
-// are unaffected: the database always reflects the latest upstream truth.
+// Filter that decides whether to record a change in domain_updates.
 function isMeaningfulChange(
-  changeType: string, field: string, oldV: unknown, newV: unknown,
+  changeType: string,
+  field: string,
+  oldV: unknown,
+  newV: unknown,
 ): boolean {
   // Removals clear a value (newV is always null), so gauge them by the old value.
   if (changeType === "removed") return !isSentinel(oldV);
   if (isSentinel(newV)) return false;
-  if (field.startsWith("dates_") && datesEquivalent(oldV, newV)) return false;
-  if (typeof oldV === "string" && typeof newV === "string"
-      && normalizeForCompare(field, oldV) === normalizeForCompare(field, newV)) {
+  if (field.startsWith("dates_") && !dateChangedBeyond(oldV, newV)) return false;
+  if (
+    typeof oldV === "string" && typeof newV === "string" &&
+    normalizeForCompare(field, oldV) === normalizeForCompare(field, newV)
+  ) {
     return false;
   }
-  return (oldV ?? "").toString().toLowerCase() !== (newV ?? "").toString().toLowerCase();
+  return (oldV ?? "").toString().toLowerCase() !==
+    (newV ?? "").toString().toLowerCase();
 }
 
 const changeTypeToNotificationType: Record<string, string> = {
@@ -135,7 +129,10 @@ const fieldToHumanName: Record<string, string> = {
 
 // Insert a notification row when the user has the relevant preference enabled.
 async function maybeNotify(
-  ctx: Ctx, field: string, oldValue: any, newValue: any,
+  ctx: Ctx,
+  field: string,
+  oldValue: any,
+  newValue: any,
 ) {
   const notificationType = changeTypeToNotificationType[field];
   if (!notificationType) return;
@@ -175,7 +172,11 @@ async function maybeNotify(
 
 // Record a single domain change row plus optional notification.
 async function recordChange(
-  ctx: Ctx, changeType: string, field: string, oldValue: any, newValue: any,
+  ctx: Ctx,
+  changeType: string,
+  field: string,
+  oldValue: any,
+  newValue: any,
 ) {
   if (!isMeaningfulChange(changeType, field, oldValue, newValue)) return;
   try {
@@ -194,7 +195,9 @@ async function recordChange(
     });
     await maybeNotify(ctx, field, oldValue, newValue);
   } catch (err) {
-    logger.error(`Failed to record change for ${field}: ${(err as Error).message}`);
+    logger.error(
+      `Failed to record change for ${field}: ${(err as Error).message}`,
+    );
   }
 }
 
@@ -214,11 +217,14 @@ async function resolveRegistrarId(ctx: Ctx, name: string, url: string | null) {
 
 // True when the incoming registrar is a genuinely different entity, ignoring
 // formatting so near-identical names do not churn registrar_id.
-function registrarChanged(currentName: string | null, newName: unknown): boolean {
+function registrarChanged(
+  currentName: string | null,
+  newName: unknown,
+): boolean {
   if (isSentinel(newName)) return false;
   if (isSentinel(currentName)) return true;
-  return normalizeForCompare("registrar", currentName as string)
-    !== normalizeForCompare("registrar", newName as string);
+  return normalizeForCompare("registrar", currentName as string) !==
+    normalizeForCompare("registrar", newName as string);
 }
 
 // Update the registrar relation when the upstream names a different registrar.
@@ -227,7 +233,11 @@ async function syncRegistrar(ctx: Ctx, info: any, current: any) {
   const currentName = current.registrars?.name ?? null;
   if (!registrarChanged(currentName, newName)) return;
   await recordChange(ctx, "updated", "registrar", currentName, newName);
-  const registrarId = await resolveRegistrarId(ctx, newName, info.registrar?.url ?? null);
+  const registrarId = await resolveRegistrarId(
+    ctx,
+    newName,
+    info.registrar?.url ?? null,
+  );
   if (registrarId) {
     await ctx.sb.from("domains").update({ registrar_id: registrarId })
       .eq("id", ctx.domainId);
@@ -235,7 +245,12 @@ async function syncRegistrar(ctx: Ctx, info: any, current: any) {
 }
 
 const WHOIS_FIELDS = [
-  "name", "organization", "state", "city", "country", "postal_code",
+  "name",
+  "organization",
+  "state",
+  "city",
+  "country",
+  "postal_code",
 ] as const;
 
 // Diff WHOIS contact fields and write a SINGLE upsert with every changed field.
@@ -249,7 +264,11 @@ async function syncWhois(ctx: Ctx, info: any, current: any) {
     if (isSentinel(newValue)) continue;
     if (isDifferent(newValue, existing[field])) {
       await recordChange(
-        ctx, "updated", `whois_${field}`, existing[field] ?? null, newValue,
+        ctx,
+        "updated",
+        `whois_${field}`,
+        existing[field] ?? null,
+        newValue,
       );
       updates[field] = newValue;
     }
@@ -264,25 +283,27 @@ async function syncWhois(ctx: Ctx, info: any, current: any) {
 }
 
 // Sync a single DNS record set (NS/MX/TXT). Skips writes when upstream is empty.
-async function syncDnsRecordSet(ctx: Ctx, recordType: string, newRecords: string[]) {
+async function syncDnsRecordSet(
+  ctx: Ctx,
+  recordType: string,
+  newRecords: string[],
+) {
   const { data: currentRecords } = await ctx.sb.from("dns_records")
     .select("*").eq("domain_id", ctx.domainId).eq("record_type", recordType);
   const current = currentRecords ?? [];
   if (!newRecords.length && current.length) return;
 
   const lower = newRecords.map((r) => r.toLowerCase());
-  const added = lower.filter((r) =>
-    !current.some((cr) => cr.record_value.toLowerCase() === r)
-  );
-  const removed = current.filter((cr) =>
-    !lower.includes(cr.record_value.toLowerCase())
-  );
+  const added = lower.filter((r) => !current.some((cr) => cr.record_value.toLowerCase() === r));
+  const removed = current.filter((cr) => !lower.includes(cr.record_value.toLowerCase()));
   const tag = `dns_${recordType.toLowerCase()}`;
 
   for (const value of added) {
     await recordChange(ctx, "added", tag, null, value);
     await ctx.sb.from("dns_records").insert({
-      domain_id: ctx.domainId, record_type: recordType, record_value: value,
+      domain_id: ctx.domainId,
+      record_type: recordType,
+      record_value: value,
     });
   }
   for (const r of removed) {
@@ -293,7 +314,9 @@ async function syncDnsRecordSet(ctx: Ctx, recordType: string, newRecords: string
 
 async function syncDns(ctx: Ctx, info: any) {
   const map: Record<string, string> = {
-    NS: "nameServers", TXT: "txtRecords", MX: "mxRecords",
+    NS: "nameServers",
+    TXT: "txtRecords",
+    MX: "mxRecords",
   };
   for (const [recordType, key] of Object.entries(map)) {
     const newRecords = (info.dns?.[key] ?? []) as string[];
@@ -304,30 +327,35 @@ async function syncDns(ctx: Ctx, info: any) {
 // Sync IPs to match upstream. Round-robin DNS makes the change log noisy, so
 // add/remove events are suppressed unless LOG_IP_CHANGES=true.
 async function syncIpVersion(
-  ctx: Ctx, version: "ipv4" | "ipv6", newIps: string[],
+  ctx: Ctx,
+  version: "ipv4" | "ipv6",
+  newIps: string[],
 ) {
   const { data: currentIps } = await ctx.sb.from("ip_addresses")
-    .select("*").eq("domain_id", ctx.domainId).eq("is_ipv6", version === "ipv6");
+    .select("*").eq("domain_id", ctx.domainId).eq(
+      "is_ipv6",
+      version === "ipv6",
+    );
   const current = currentIps ?? [];
   if (!newIps.length && current.length) return;
 
   const lower = newIps.map((ip) => ip.toLowerCase());
-  const added = lower.filter((ip) =>
-    !current.some((cip) => cip.ip_address.toLowerCase() === ip)
-  );
-  const removed = current.filter((cip) =>
-    !lower.includes(cip.ip_address.toLowerCase())
-  );
+  const added = lower.filter((ip) => !current.some((cip) => cip.ip_address.toLowerCase() === ip));
+  const removed = current.filter((cip) => !lower.includes(cip.ip_address.toLowerCase()));
   const tag = `ip_${version}`;
 
   for (const value of added) {
     if (LOG_IP_CHANGES) await recordChange(ctx, "added", tag, null, value);
     await ctx.sb.from("ip_addresses").insert({
-      domain_id: ctx.domainId, ip_address: value, is_ipv6: version === "ipv6",
+      domain_id: ctx.domainId,
+      ip_address: value,
+      is_ipv6: version === "ipv6",
     });
   }
   for (const r of removed) {
-    if (LOG_IP_CHANGES) await recordChange(ctx, "removed", tag, r.ip_address, null);
+    if (LOG_IP_CHANGES) {
+      await recordChange(ctx, "removed", tag, r.ip_address, null);
+    }
     await ctx.sb.from("ip_addresses").delete().eq("id", r.id);
   }
 }
@@ -350,15 +378,17 @@ async function syncSsl(ctx: Ctx, info: any, current: any) {
   if (!existing) {
     const { error } = await ctx.sb.from("ssl_certificates").insert({
       domain_id: ctx.domainId,
-      issuer, valid_from: validFrom, valid_to: validTo,
+      issuer,
+      valid_from: validFrom,
+      valid_to: validTo,
     });
     if (error) logger.error(`ssl_certificates insert failed: ${error.message}`);
     return;
   }
 
-  const changed = isDifferent(issuer, existing.issuer)
-    || !areDatesEqual(validFrom, existing.valid_from)
-    || !areDatesEqual(validTo, existing.valid_to);
+  const changed = isDifferent(issuer, existing.issuer) ||
+    !areDatesEqual(validFrom, existing.valid_from) ||
+    !areDatesEqual(validTo, existing.valid_to);
   if (!changed) return;
 
   await recordChange(ctx, "updated", "ssl_issuer", existing.issuer, issuer);
@@ -381,14 +411,13 @@ async function syncStatuses(ctx: Ctx, info: any) {
   const added = newStatuses.filter((s: string) =>
     !current.some((cs: any) => cs.status_code.toLowerCase() === s)
   );
-  const removed = current.filter((cs: any) =>
-    !newStatuses.includes(cs.status_code.toLowerCase())
-  );
+  const removed = current.filter((cs: any) => !newStatuses.includes(cs.status_code.toLowerCase()));
 
   for (const value of added) {
     await recordChange(ctx, "added", "status", null, value);
     await ctx.sb.from("domain_statuses").insert({
-      domain_id: ctx.domainId, status_code: value,
+      domain_id: ctx.domainId,
+      status_code: value,
     });
   }
   for (const r of removed) {
@@ -401,20 +430,33 @@ async function syncStatuses(ctx: Ctx, info: any) {
 // Never overwrite existing data with empty upstream.
 async function syncDates(ctx: Ctx, info: any, current: any) {
   const newExpiry = sanitizeDate(info.dates?.expiry_date);
-  if (newExpiry && !areDatesEqual(newExpiry, current.expiry_date)) {
+  // Only write/record when past 1-2 day jitter, so a near-identical upstream
+  // value never flips the stored date or logs a false change.
+  if (newExpiry && dateChangedBeyond(current.expiry_date, newExpiry)) {
     await recordChange(
-      ctx, "updated", "dates_expiry", current.expiry_date, newExpiry,
+      ctx,
+      "updated",
+      "dates_expiry",
+      current.expiry_date,
+      newExpiry,
     );
     await ctx.sb.from("domains").update({ expiry_date: newExpiry })
       .eq("id", ctx.domainId);
   }
   const newUpdated = sanitizeDate(info.dates?.updated_date);
   const curUpdated = sanitizeDate(current.updated_date);
-  // Only advance updated_date; never regress it to an older upstream value.
-  if (newUpdated && (!curUpdated ||
-      new Date(newUpdated).getTime() > new Date(curUpdated).getTime())) {
+  // Only advance updated_date, and only past jitter; never regress it.
+  if (
+    newUpdated && dateChangedBeyond(curUpdated, newUpdated) &&
+    (!curUpdated ||
+      new Date(newUpdated).getTime() > new Date(curUpdated).getTime())
+  ) {
     await recordChange(
-      ctx, "updated", "dates_updated", current.updated_date, newUpdated,
+      ctx,
+      "updated",
+      "dates_updated",
+      current.updated_date,
+      newUpdated,
     );
     await ctx.sb.from("domains").update({ updated_date: newUpdated })
       .eq("id", ctx.domainId);
@@ -423,7 +465,11 @@ async function syncDates(ctx: Ctx, info: any, current: any) {
     const newCreation = sanitizeDate(info.dates?.creation_date);
     if (newCreation) {
       await recordChange(
-        ctx, "added", "dates_registration", null, newCreation,
+        ctx,
+        "added",
+        "dates_registration",
+        null,
+        newCreation,
       );
       await ctx.sb.from("domains").update({ registration_date: newCreation })
         .eq("id", ctx.domainId)
@@ -451,7 +497,8 @@ async function syncDomain(ctx: Ctx, info: any, current: any) {
 
 const jsonResp = (body: unknown, status: number) =>
   new Response(JSON.stringify(body), {
-    status, headers: { "Content-Type": "application/json" },
+    status,
+    headers: { "Content-Type": "application/json" },
   });
 
 serve(async (req) => {
@@ -495,9 +542,12 @@ serve(async (req) => {
       .maybeSingle();
 
     if (error) {
-      logger.error(`Failed to fetch domain record for ${domain}: ${error.message}`);
+      logger.error(
+        `Failed to fetch domain record for ${domain}: ${error.message}`,
+      );
       return jsonResp({
-        message: "❌ Error fetching domain record", error: error.message,
+        message: "❌ Error fetching domain record",
+        error: error.message,
       }, 500);
     }
     if (!currentDomainRecord) {
@@ -516,11 +566,17 @@ serve(async (req) => {
     );
     if (!hasAnySignal) {
       logger.warn(`No usable data resolved for ${domain}, skipping update`);
-      return jsonResp({ message: `⚠️ ${domain} resolved no data, skipped` }, 200);
+      return jsonResp(
+        { message: `⚠️ ${domain} resolved no data, skipped` },
+        200,
+      );
     }
 
     const ctx: Ctx = {
-      sb, domainId: currentDomainRecord.id, userId: user_id, changes: 0,
+      sb,
+      domainId: currentDomainRecord.id,
+      userId: user_id,
+      changes: 0,
     };
     await syncDomain(ctx, newDomainInfo, currentDomainRecord);
 
@@ -532,7 +588,8 @@ serve(async (req) => {
     const msg = err instanceof Error ? err.message : "Unknown error";
     logger.error(`Failed to update ${domain}: ${msg}`);
     return jsonResp({
-      message: `⚠️ ${domain} could not be updated`, error: msg,
+      message: `⚠️ ${domain} could not be updated`,
+      error: msg,
     }, 500);
   }
 });

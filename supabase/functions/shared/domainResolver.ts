@@ -1,5 +1,5 @@
 import { Logger } from "./logger.ts";
-import { getWhoisInfo, type WhoisResult } from "./whois.ts";
+import { getWhoisInfo, normalizeDomain, type WhoisResult } from "./whois.ts";
 
 const log = new Logger("[domainResolver]");
 
@@ -9,7 +9,13 @@ const DOH_URL = "https://cloudflare-dns.com/dns-query";
 const SSL_LABS_URL = "https://api.ssllabs.com/api/v3/analyze";
 const IP_API_URL = "http://ip-api.com/json";
 
-const DNS_TYPES: Record<string, number> = { A: 1, AAAA: 28, NS: 2, MX: 15, TXT: 16 };
+const DNS_TYPES: Record<string, number> = {
+  A: 1,
+  AAAA: 28,
+  NS: 2,
+  MX: 15,
+  TXT: 16,
+};
 
 export interface DomainInfo {
   domainName: string;
@@ -59,9 +65,34 @@ export interface ResolveResult {
   errors: string[];
 }
 
+function emptyDomainInfo(domainName: string): DomainInfo {
+  return {
+    domainName,
+    status: [],
+    ip_addresses: { ipv4: [], ipv6: [] },
+    dates: { expiry_date: null, updated_date: null, creation_date: null },
+    registrar: { name: null, id: null, url: null, registryDomainId: null },
+    whois: whoisToContact({}),
+    abuse: { email: null, phone: null },
+    dns: { dnssec: null, nameServers: [], mxRecords: [], txtRecords: [] },
+    ssl: {
+      issuer: null,
+      valid_from: null,
+      valid_to: null,
+      subject: null,
+      fingerprint: null,
+      key_size: 0,
+      signature_algorithm: null,
+    },
+    host: null,
+  };
+}
+
 // Run a function and capture any thrown error into the shared list.
 async function safeRun<T>(
-  fn: () => Promise<T>, label: string, errors: string[],
+  fn: () => Promise<T>,
+  label: string,
+  errors: string[],
 ): Promise<T | undefined> {
   try {
     return await fn();
@@ -124,12 +155,19 @@ function dnAttr(dn: unknown, attr: string): string | null {
 // Pull cached SSL Labs data; returns {} if not yet ready or unreachable.
 async function getSslData(domain: string): Promise<DomainInfo["ssl"]> {
   const empty: DomainInfo["ssl"] = {
-    issuer: null, valid_from: null, valid_to: null, subject: null,
-    fingerprint: null, key_size: 0, signature_algorithm: null,
+    issuer: null,
+    valid_from: null,
+    valid_to: null,
+    subject: null,
+    fingerprint: null,
+    key_size: 0,
+    signature_algorithm: null,
   };
   try {
     const url = `${SSL_LABS_URL}?host=${encodeURIComponent(domain)}&fromCache=on&all=done`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+    });
     if (!res.ok) return empty;
     const data = await res.json();
     const cert = data?.certs?.[0];
@@ -151,9 +189,12 @@ async function getSslData(domain: string): Promise<DomainInfo["ssl"]> {
 // Best-effort IP geolocation lookup; returns {} on failure or rate-limit.
 async function getHostData(ip: string): Promise<Record<string, unknown>> {
   try {
-    const res = await fetch(`${IP_API_URL}/${encodeURIComponent(ip)}?fields=12249`, {
-      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
-    });
+    const res = await fetch(
+      `${IP_API_URL}/${encodeURIComponent(ip)}?fields=12249`,
+      {
+        signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+      },
+    );
     if (!res.ok) return {};
     const data = await res.json();
     // ip-api returns regionName; keep both for legacy frontend compatibility.
@@ -165,7 +206,9 @@ async function getHostData(ip: string): Promise<Record<string, unknown>> {
 }
 
 // Override Cloudflare registrar URL when the upstream omits it.
-function patchCloudflareUrl(reg: WhoisResult["registrar"]): WhoisResult["registrar"] {
+function patchCloudflareUrl(
+  reg: WhoisResult["registrar"],
+): WhoisResult["registrar"] {
   if (reg.name === "Cloudflare, Inc." && !reg.url) {
     return { ...reg, url: "https://www.cloudflare.com" };
   }
@@ -174,7 +217,9 @@ function patchCloudflareUrl(reg: WhoisResult["registrar"]): WhoisResult["registr
 
 // Build a redacted-aware WHOIS object compatible with the legacy response shape.
 function whoisToContact(whois: WhoisResult["whois"]): DomainInfo["whois"] {
-  const v = (x: string | null | undefined) => (x && x.trim() ? x : "DATA REDACTED");
+  const v = (
+    x: string | null | undefined,
+  ) => (x && x.trim() ? x : "DATA REDACTED");
   return {
     name: v(whois.name),
     organization: v(whois.organization),
@@ -200,15 +245,27 @@ async function gatherNetworkData(domain: string, errors: string[]) {
     ? await safeRun(() => getHostData(ipv4[0]), "host-lookup", errors)
     : null;
   return {
-    ipv4: ipv4 ?? [], ipv6: ipv6 ?? [], ns: ns ?? [],
-    mx: mx ?? [], txt: txt ?? [], ssl: ssl ?? null, host: host ?? null,
+    ipv4: ipv4 ?? [],
+    ipv6: ipv6 ?? [],
+    ns: ns ?? [],
+    mx: mx ?? [],
+    txt: txt ?? [],
+    ssl: ssl ?? null,
+    host: host ?? null,
   };
 }
 
 // Resolve full domain info: WHOIS plus parallel DNS/SSL/host lookups.
-export async function resolveDomainInfo(domain: string): Promise<ResolveResult> {
+export async function resolveDomainInfo(
+  domain: string,
+): Promise<ResolveResult> {
   const errors: string[] = [];
-  const trimmed = domain.replace(/^(?:https?:\/\/)?(?:www\.)?/i, "").trim().toLowerCase();
+  const trimmed = normalizeDomain(domain) ?? "";
+
+  if (!trimmed) {
+    errors.push("invalid-domain");
+    return { domainInfo: emptyDomainInfo(domain.trim().toLowerCase()), errors };
+  }
 
   const [whois, network] = await Promise.all([
     safeRun(() => getWhoisInfo(trimmed), "whois-lookup", errors),
@@ -222,8 +279,13 @@ export async function resolveDomainInfo(domain: string): Promise<ResolveResult> 
     dates: { creation_date: null, updated_date: null, expiry_date: null },
     registrar: { name: null, id: null, url: null, registryDomainId: null },
     whois: {
-      name: null, organization: null, street: null, city: null,
-      state: null, country: null, postal_code: null,
+      name: null,
+      organization: null,
+      street: null,
+      city: null,
+      state: null,
+      country: null,
+      postal_code: null,
     },
     abuse: { email: null, phone: null },
   };
@@ -256,8 +318,13 @@ export async function resolveDomainInfo(domain: string): Promise<ResolveResult> 
       txtRecords: network.txt,
     },
     ssl: network.ssl ?? {
-      issuer: null, valid_from: null, valid_to: null, subject: null,
-      fingerprint: null, key_size: 0, signature_algorithm: null,
+      issuer: null,
+      valid_from: null,
+      valid_to: null,
+      subject: null,
+      fingerprint: null,
+      key_size: 0,
+      signature_algorithm: null,
     },
     host: network.host,
   };

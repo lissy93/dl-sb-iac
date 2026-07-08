@@ -6,6 +6,8 @@ const TIMEOUT_MS = 5000;
 const MAX_WHOIS_BYTES = 256 * 1024;
 const IANA_BOOTSTRAP_RDAP = "https://data.iana.org/rdap/dns.json";
 const IANA_WHOIS = "whois.iana.org";
+const WHO_DAT_DEFAULT_URL = "https://who-dat.as93.net";
+const WHO_DAT_UA = "domain-locker/1.0 (who-dat client)";
 
 const tldWhoisCache = new Map<string, string | null>();
 let rdapBootstrap: Map<string, string> | null = null;
@@ -49,18 +51,78 @@ export interface WhoisResult {
 }
 
 const MONTHS: Record<string, number> = {
-  jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6,
-  jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12,
+  jan: 1,
+  feb: 2,
+  mar: 3,
+  apr: 4,
+  may: 5,
+  jun: 6,
+  jul: 7,
+  aug: 8,
+  sep: 9,
+  oct: 10,
+  nov: 11,
+  dec: 12,
 };
+
+const DOMAIN_RE =
+  /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
+
+export function normalizeDomain(input: string): string | null {
+  const raw = input.trim();
+  if (!raw) return null;
+  if ([...raw].some((ch) => {
+    const code = ch.charCodeAt(0);
+    return code <= 31 || code === 127;
+  })) return null;
+
+  let host = raw;
+  try {
+    const url = new URL(
+      /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `http://${raw}`,
+    );
+    host = url.hostname;
+  } catch {
+    return null;
+  }
+
+  host = host.replace(/^www\./i, "").replace(/\.$/, "").toLowerCase();
+  if (!DOMAIN_RE.test(host)) return null;
+  // Reject bare IPs and other all-numeric TLDs, which are never registrable.
+  const tld = host.slice(host.lastIndexOf(".") + 1);
+  return /^\d+$/.test(tld) ? null : host;
+}
+
+function isValidDateParts(year: number, month: number, day: number): boolean {
+  if (year < 1000 || month < 1 || month > 12 || day < 1 || day > 31) {
+    return false;
+  }
+  const d = new Date(Date.UTC(year, month - 1, day));
+  return d.getUTCFullYear() === year &&
+    d.getUTCMonth() === month - 1 &&
+    d.getUTCDate() === day;
+}
+
+function isoDate(year: string, month: string, day: string): string | null {
+  const y = Number(year), m = Number(month), d = Number(day);
+  if (!isValidDateParts(y, m, d)) return null;
+  return `${String(y).padStart(4, "0")}-${String(m).padStart(2, "0")}-${
+    String(d).padStart(2, "0")
+  }`;
+}
 
 // Parse a WHOIS date in any common format to YYYY-MM-DD, or null if unparseable.
 export function parseDate(input: unknown): string | null {
   if (!input || typeof input !== "string") return null;
-  const s = input.trim().replace(/\s+\([^)]*\)\s*$/, "").replace(/\s+[A-Z]{2,5}$/, "");
+  const s = input.trim().replace(/\s+\([^)]*\)\s*$/, "").replace(
+    /\s+[A-Z]{2,5}$/,
+    "",
+  );
   if (!s) return null;
 
-  const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
-  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
+  // ISO first, allowing the dotted (.ru/.su) and slashed year-first variants.
+  const iso = s.match(/^(\d{4})[-/.](\d{2})[-/.](\d{2})/);
+  if (iso) return isoDate(iso[1], iso[2], iso[3]);
 
   const dmy = s.match(/^(\d{1,2})[\-\/.](\d{1,2})[\-\/.](\d{4})/);
   if (dmy) {
@@ -68,49 +130,106 @@ export function parseDate(input: unknown): string | null {
     const ai = +a, bi = +b;
     const day = ai > 12 ? ai : (bi > 12 ? bi : ai);
     const month = ai > 12 ? bi : (bi > 12 ? ai : bi);
-    if (day >= 1 && day <= 31 && month >= 1 && month <= 12) {
-      return `${y}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
-    }
+    return isoDate(y, String(month), String(day));
   }
 
   const dmonY = s.match(/^(\d{1,2})[\-\s]([A-Za-z]{3,9})[\-\s](\d{4})/);
   if (dmonY) {
     const month = MONTHS[dmonY[2].slice(0, 3).toLowerCase()];
     if (month) {
-      return `${dmonY[3]}-${String(month).padStart(2, "0")}-${dmonY[1].padStart(2, "0")}`;
+      return isoDate(dmonY[3], String(month), dmonY[1]);
     }
   }
 
+  // Last resort. Use local components (runtime is UTC) so a date-only string is
+  // not shifted a day by the toISOString timezone conversion.
   const parsed = new Date(s);
-  if (!isNaN(parsed.getTime())) return parsed.toISOString().slice(0, 10);
+  if (!isNaN(parsed.getTime())) {
+    return isoDate(
+      String(parsed.getFullYear()),
+      String(parsed.getMonth() + 1),
+      String(parsed.getDate()),
+    );
+  }
   return null;
 }
 
+// Coerce any date-ish value (WHOIS string, Date, or DB timestamp) to a clean
+// YYYY-MM-DD string or null. This is the single format written to the database.
+export function toIsoDate(value: unknown): string | null {
+  if (value == null) return null;
+  return parseDate(value instanceof Date ? value.toISOString() : String(value));
+}
+
+// True when a WHOIS date moved by more than `days` (default 2). Timezone rounding
+// and registry-vs-registrar reporting differ by a day or two, while real expiry
+// and registration changes are about a year, so smaller moves are treated as
+// noise. A null new value is never a change; a first non-null value always is.
+export function dateChangedBeyond(
+  oldV: unknown,
+  newV: unknown,
+  days = 2,
+): boolean {
+  const b = toIsoDate(newV);
+  if (!b) return false;
+  const a = toIsoDate(oldV);
+  if (!a) return true;
+  const diff = Math.abs(new Date(b).getTime() - new Date(a).getTime());
+  return diff > days * 86_400_000;
+}
+
 const KNOWN_STATUSES = [
-  "clientDeleteProhibited", "clientHold", "clientRenewProhibited",
-  "clientTransferProhibited", "clientUpdateProhibited",
-  "serverDeleteProhibited", "serverHold", "serverRenewProhibited",
-  "serverTransferProhibited", "serverUpdateProhibited",
-  "inactive", "ok", "pendingCreate", "pendingDelete",
-  "pendingRenew", "pendingRestore", "pendingTransfer", "pendingUpdate",
-  "addPeriod", "autoRenewPeriod", "renewPeriod", "transferPeriod",
+  "clientDeleteProhibited",
+  "clientHold",
+  "clientRenewProhibited",
+  "clientTransferProhibited",
+  "clientUpdateProhibited",
+  "serverDeleteProhibited",
+  "serverHold",
+  "serverRenewProhibited",
+  "serverTransferProhibited",
+  "serverUpdateProhibited",
+  "inactive",
+  "ok",
+  "pendingCreate",
+  "pendingDelete",
+  "pendingRenew",
+  "pendingRestore",
+  "pendingTransfer",
+  "pendingUpdate",
+  "addPeriod",
+  "autoRenewPeriod",
+  "renewPeriod",
+  "transferPeriod",
 ];
 
-// Extract ICANN status codes from a free-text or array status field.
+// Extract ICANN status codes from an EPP (camelCase) or RDAP (spaced) status
+// field. Spaces/underscores are stripped so both vocabularies match, and RDAP's
+// "active" is mapped to the EPP "ok" the other sources emit.
 function parseStatusArray(input: unknown): string[] {
   if (!input) return [];
   const raw = Array.isArray(input) ? input.join(" ") : String(input);
-  const lower = raw.toLowerCase();
-  return Array.from(new Set(KNOWN_STATUSES.filter((s) => lower.includes(s.toLowerCase()))));
+  const compact = raw.toLowerCase().replace(/[\s_]+/g, "");
+  const matched = new Set(
+    KNOWN_STATUSES.filter((s) => compact.includes(s.toLowerCase())),
+  );
+  if (/(?:^|[^a-z])active(?:[^a-z]|$)/i.test(raw)) matched.add("ok");
+  return Array.from(matched);
 }
 
 // Open a TCP connection, send the query, and force-close on timeout to free the socket.
-async function whoisPort43(host: string, query: string, label: string): Promise<string> {
+async function whoisPort43(
+  host: string,
+  query: string,
+  label: string,
+): Promise<string> {
   const conn = await Deno.connect({ hostname: host, port: 43 });
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
-    try { conn.close(); } catch { /* ignore */ }
+    try {
+      conn.close();
+    } catch { /* ignore */ }
   }, TIMEOUT_MS);
   try {
     const writer = conn.writable.getWriter();
@@ -121,7 +240,9 @@ async function whoisPort43(host: string, query: string, label: string): Promise<
     for await (const chunk of conn.readable) {
       total += chunk.length;
       if (total > MAX_WHOIS_BYTES) {
-        try { conn.close(); } catch { /* ignore */ }
+        try {
+          conn.close();
+        } catch { /* ignore */ }
         throw new Error(`${label} response exceeded ${MAX_WHOIS_BYTES} bytes`);
       }
       chunks.push(chunk);
@@ -129,11 +250,16 @@ async function whoisPort43(host: string, query: string, label: string): Promise<
     if (timedOut) throw new Error(`${label} timeout after ${TIMEOUT_MS}ms`);
     const buf = new Uint8Array(total);
     let off = 0;
-    for (const c of chunks) { buf.set(c, off); off += c.length; }
+    for (const c of chunks) {
+      buf.set(c, off);
+      off += c.length;
+    }
     return new TextDecoder("utf-8", { fatal: false }).decode(buf);
   } finally {
     clearTimeout(timer);
-    try { conn.close(); } catch { /* already closed */ }
+    try {
+      conn.close();
+    } catch { /* already closed */ }
   }
 }
 
@@ -161,7 +287,10 @@ function parseWhoisText(text: string): Record<string, string[]> {
     if (!line || /^[%#>]/.test(line) || /^[-=]{2,}$/.test(line)) continue;
     const m = line.match(/^([A-Za-z][A-Za-z0-9 _\-\/]*?):\s*(.+)$/);
     if (!m) continue;
-    const key = m[1].trim().toLowerCase().replace(/[\s\/]+/g, "_").replace(/_+/g, "_");
+    const key = m[1].trim().toLowerCase().replace(/[\s\/]+/g, "_").replace(
+      /_+/g,
+      "_",
+    );
     const value = m[2].trim();
     if (!value || /^redacted/i.test(value)) continue;
     (out[key] ??= []).push(value);
@@ -169,37 +298,75 @@ function parseWhoisText(text: string): Record<string, string[]> {
   return out;
 }
 
+// Nullify placeholder junk ("", "none", "null", "n/a", "-", "unknown") upstream
+// sources emit for missing fields, so it never reaches the database or UI.
+function cleanStr(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  const s = v.trim();
+  if (!s || /^(none|null|n\/a|-|unknown)$/i.test(s)) return null;
+  return s;
+}
+
 // Look up a value by trying any of the candidate keys in order.
-function pick(data: Record<string, string[]>, ...keys: string[]): string | null {
+function pick(
+  data: Record<string, string[]>,
+  ...keys: string[]
+): string | null {
   for (const k of keys) {
-    const arr = data[k];
-    if (arr && arr.length) return arr[0];
+    const v = cleanStr(data[k]?.[0]);
+    if (v) return v;
   }
   return null;
 }
 
 // Convert a parsed WHOIS dictionary into a normalised WhoisResult.
-function whoisDataToResult(domain: string, data: Record<string, string[]>): WhoisResult {
+function whoisDataToResult(
+  domain: string,
+  data: Record<string, string[]>,
+): WhoisResult {
   const registrarLine = pick(data, "registrar", "sponsoring_registrar");
-  const registrarName = registrarLine?.replace(/\s*\[.*\]\s*$/, "")?.trim() || null;
+  const registrarName = registrarLine?.replace(/\s*\[.*\]\s*$/, "")?.trim() ||
+    null;
 
   return {
     domainName: pick(data, "domain_name", "domain") ?? domain,
-    status: parseStatusArray(data.domain_status ?? data.status ?? data.status_code),
+    status: parseStatusArray(
+      data.domain_status ?? data.status ?? data.status_code,
+    ),
     dnssec: pick(data, "dnssec"),
     dates: {
       creation_date: parseDate(pick(
-        data, "creation_date", "created_date", "registered_on", "created", "registered",
-        "registration_date", "domain_registration_date", "registration_time",
+        data,
+        "creation_date",
+        "created_date",
+        "registered_on",
+        "created",
+        "registered",
+        "registration_date",
+        "domain_registration_date",
+        "registration_time",
       )),
       updated_date: parseDate(pick(
-        data, "updated_date", "last_updated", "last_modified", "last_update",
-        "modified", "domain_last_updated",
+        data,
+        "updated_date",
+        "last_updated",
+        "last_modified",
+        "last_update",
+        "modified",
+        "domain_last_updated",
       )),
       expiry_date: parseDate(pick(
-        data, "registry_expiry_date", "registrar_registration_expiration_date",
-        "expiry_date", "expiration_time", "expiration_date", "expires", "expire",
-        "expires_on", "paid_till", "paid_until",
+        data,
+        "registry_expiry_date",
+        "registrar_registration_expiration_date",
+        "expiry_date",
+        "expiration_time",
+        "expiration_date",
+        "expires",
+        "expire",
+        "expires_on",
+        "paid_till",
+        "paid_until",
       )),
     },
     registrar: {
@@ -210,7 +377,11 @@ function whoisDataToResult(domain: string, data: Record<string, string[]>): Whoi
     },
     whois: {
       name: pick(data, "registrant_name"),
-      organization: pick(data, "registrant_organization", "registrant_organisation"),
+      organization: pick(
+        data,
+        "registrant_organization",
+        "registrant_organisation",
+      ),
       street: pick(data, "registrant_street", "registrant_address"),
       city: pick(data, "registrant_city"),
       state: pick(data, "registrant_state_province", "registrant_state"),
@@ -218,16 +389,28 @@ function whoisDataToResult(domain: string, data: Record<string, string[]>): Whoi
       postal_code: pick(data, "registrant_postal_code", "registrant_post_code"),
     },
     abuse: {
-      email: pick(data, "registrar_abuse_contact_email", "abuse_contact_email", "abuse_email"),
-      phone: pick(data, "registrar_abuse_contact_phone", "abuse_contact_phone", "abuse_phone"),
+      email: pick(
+        data,
+        "registrar_abuse_contact_email",
+        "abuse_contact_email",
+        "abuse_email",
+      ),
+      phone: pick(
+        data,
+        "registrar_abuse_contact_phone",
+        "abuse_contact_phone",
+        "abuse_phone",
+      ),
     },
   };
 }
 
 // Returns true if the result has at least the bare minimum to be useful.
-function hasUsefulData(r: WhoisResult | null): boolean {
+function hasUsefulData(r: WhoisResult | null): r is WhoisResult {
   if (!r) return false;
-  return Boolean(r.dates.expiry_date || r.registrar.name || r.dates.creation_date);
+  return Boolean(
+    r.dates.expiry_date || r.registrar.name || r.dates.creation_date,
+  );
 }
 
 // Primary path: query the registry's WHOIS server over TCP/43.
@@ -243,21 +426,31 @@ async function tryPort43(domain: string): Promise<WhoisResult | null> {
     let result = whoisDataToResult(domain, parseWhoisText(text));
     if (!hasUsefulData(result)) return null;
 
-    const referral = text.match(/(?:^|\n)\s*(?:Registrar WHOIS Server|Whois Server):\s*(\S+)/i);
+    const referral = text.match(
+      /(?:^|\n)\s*(?:Registrar WHOIS Server|Whois Server):\s*(\S+)/i,
+    );
     if (referral && referral[1] && referral[1].toLowerCase() !== server) {
       try {
-        const refText = await whoisPort43(referral[1], domain, `whois:${referral[1]}`);
+        const refText = await whoisPort43(
+          referral[1],
+          domain,
+          `whois:${referral[1]}`,
+        );
         const refResult = whoisDataToResult(domain, parseWhoisText(refText));
         if (hasUsefulData(refResult)) {
           result = mergeResults(result, refResult);
         }
       } catch (err) {
-        log.debug(`Referral WHOIS to ${referral[1]} failed: ${(err as Error).message}`);
+        log.debug(
+          `Referral WHOIS to ${referral[1]} failed: ${(err as Error).message}`,
+        );
       }
     }
     return result;
   } catch (err) {
-    log.warn(`Port-43 WHOIS to ${server} failed for ${domain}: ${(err as Error).message}`);
+    log.warn(
+      `Port-43 WHOIS to ${server} failed for ${domain}: ${(err as Error).message}`,
+    );
     return null;
   }
 }
@@ -268,8 +461,8 @@ async function tryPort43(domain: string): Promise<WhoisResult | null> {
 // Contact and abuse fields prefer the second source since registries usually
 // do not carry them.
 function mergeResults(a: WhoisResult, b: WhoisResult): WhoisResult {
-  const preferA = <T,>(x: T | null | undefined, y: T | null | undefined) => x ?? y ?? null;
-  const preferB = <T,>(x: T | null | undefined, y: T | null | undefined) => y ?? x ?? null;
+  const preferA = <T>(x: T | null | undefined, y: T | null | undefined) => x ?? y ?? null;
+  const preferB = <T>(x: T | null | undefined, y: T | null | undefined) => y ?? x ?? null;
   return {
     domainName: a.domainName ?? b.domainName,
     status: a.status.length ? a.status : b.status,
@@ -283,7 +476,10 @@ function mergeResults(a: WhoisResult, b: WhoisResult): WhoisResult {
       name: preferA(a.registrar.name, b.registrar.name),
       id: preferA(a.registrar.id, b.registrar.id),
       url: preferA(a.registrar.url, b.registrar.url),
-      registryDomainId: preferA(a.registrar.registryDomainId, b.registrar.registryDomainId),
+      registryDomainId: preferA(
+        a.registrar.registryDomainId,
+        b.registrar.registryDomainId,
+      ),
     },
     whois: {
       name: preferB(a.whois.name, b.whois.name),
@@ -305,7 +501,9 @@ function mergeResults(a: WhoisResult, b: WhoisResult): WhoisResult {
 async function getRdapBaseForTld(tld: string): Promise<string | null> {
   if (!rdapBootstrap) {
     try {
-      const res = await fetch(IANA_BOOTSTRAP_RDAP, { signal: AbortSignal.timeout(TIMEOUT_MS) });
+      const res = await fetch(IANA_BOOTSTRAP_RDAP, {
+        signal: AbortSignal.timeout(TIMEOUT_MS),
+      });
       if (!res.ok) throw new Error(`status ${res.status}`);
       const json = await res.json();
       const map = new Map<string, string>();
@@ -337,7 +535,13 @@ function vcardValue(vcardArray: any, field: string): string | null {
   const data = Array.isArray(vcardArray) ? vcardArray[1] : null;
   if (!Array.isArray(data)) return null;
   const entry = data.find((v) => v?.[0]?.toLowerCase() === field.toLowerCase());
-  return entry?.[3] ?? null;
+  return cleanStr(entry?.[3]);
+}
+
+// Strip an RFC3966 "tel:" prefix from a phone value.
+function stripTel(phone: string | null | undefined): string | null {
+  if (!phone) return null;
+  return phone.startsWith("tel:") ? phone.slice(4) : phone;
 }
 
 // Fallback path: query RDAP via IANA's bootstrap registry.
@@ -353,7 +557,10 @@ async function tryRdap(domain: string): Promise<WhoisResult | null> {
     });
     if (!res.ok) return null;
     const json = await res.json();
-    const events = (json.events ?? []) as { eventAction: string; eventDate: string }[];
+    const events = (json.events ?? []) as {
+      eventAction: string;
+      eventDate: string;
+    }[];
     const eventDate = (a: string) => events.find((e) => e.eventAction === a)?.eventDate ?? null;
 
     const registrar = findEntityByRole(json.entities ?? [], "registrar");
@@ -361,19 +568,25 @@ async function tryRdap(domain: string): Promise<WhoisResult | null> {
     const abuse = findEntityByRole(json.entities ?? [], "abuse");
 
     const phone = vcardValue(abuse?.vcardArray, "tel");
+    // Prefer the registrar's homepage (rel="about") over its RDAP self link.
+    // Some registries emit a literal "None" href, which cleanStr drops.
+    const regLink = (rel: string) =>
+      cleanStr(registrar?.links?.find((l: any) => l?.rel === rel)?.href);
     return {
       domainName: json.ldhName ?? domain,
       status: parseStatusArray(json.status),
       dnssec: json.secureDNS?.delegationSigned ? "signed" : null,
       dates: {
         creation_date: parseDate(eventDate("registration")),
-        updated_date: parseDate(eventDate("last changed") ?? eventDate("last update")),
+        updated_date: parseDate(
+          eventDate("last changed") ?? eventDate("last update"),
+        ),
         expiry_date: parseDate(eventDate("expiration")),
       },
       registrar: {
         name: vcardValue(registrar?.vcardArray, "fn"),
         id: registrar?.publicIds?.find((p: any) => /IANA/i.test(p?.type))?.identifier ?? null,
-        url: registrar?.links?.find((l: any) => l?.rel === "self")?.href ?? null,
+        url: regLink("about") ?? regLink("self"),
         registryDomainId: json.handle ?? null,
       },
       whois: {
@@ -387,7 +600,7 @@ async function tryRdap(domain: string): Promise<WhoisResult | null> {
       },
       abuse: {
         email: vcardValue(abuse?.vcardArray, "email"),
-        phone: phone?.startsWith("tel:") ? phone.slice(4) : phone,
+        phone: stripTel(phone),
       },
     };
   } catch (err) {
@@ -396,7 +609,86 @@ async function tryRdap(domain: string): Promise<WhoisResult | null> {
   }
 }
 
-// Last-resort paid fallback when both port-43 and RDAP fail.
+interface WhoDatContact {
+  name?: string | null;
+  organization?: string | null;
+  address?: {
+    street?: string | null;
+    city?: string | null;
+    state?: string | null;
+    postalCode?: string | null;
+    country?: string | null;
+  } | null;
+}
+
+// Map a who-dat contact block into our WhoisContact shape.
+function whoDatContact(c: WhoDatContact | null | undefined): WhoisContact {
+  const a = c?.address;
+  return {
+    name: cleanStr(c?.name),
+    organization: cleanStr(c?.organization),
+    street: cleanStr(a?.street),
+    city: cleanStr(a?.city),
+    state: cleanStr(a?.state),
+    country: cleanStr(a?.country),
+    postal_code: cleanStr(a?.postalCode),
+  };
+}
+
+// Fallback path: who-dat RDAP/WHOIS aggregator. The x-api-key header is sent only
+// when WHO_DAT_API_KEY is set, which lifts the public rate limit on our instance.
+async function tryWhoDat(domain: string): Promise<WhoisResult | null> {
+  const base = (Deno.env.get("WHO_DAT_URL") ?? WHO_DAT_DEFAULT_URL).replace(
+    /\/+$/,
+    "",
+  );
+  const key = Deno.env.get("WHO_DAT_API_KEY");
+  const headers: Record<string, string> = {
+    "User-Agent": WHO_DAT_UA,
+    "Accept": "application/json",
+  };
+  if (key) headers["x-api-key"] = key;
+
+  try {
+    const res = await fetch(`${base}/${encodeURIComponent(domain)}`, {
+      headers,
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+    if (!res.ok) {
+      log.warn(`who-dat returned ${res.status} for ${domain}`);
+      return null;
+    }
+    const j = await res.json();
+    if (j?.isRegistered === false) return null;
+    const reg = j?.registrar ?? {};
+    return {
+      domainName: j?.domain ?? domain,
+      status: parseStatusArray(j?.status),
+      dnssec: j?.dnssec?.signed ? "signed" : null,
+      dates: {
+        creation_date: parseDate(j?.dates?.created),
+        updated_date: parseDate(j?.dates?.updated),
+        expiry_date: parseDate(j?.dates?.expires),
+      },
+      registrar: {
+        name: cleanStr(reg.name),
+        id: cleanStr(reg.ianaId),
+        url: cleanStr(reg.url) ?? cleanStr(reg.whoisServer),
+        registryDomainId: cleanStr(j?.id),
+      },
+      whois: whoDatContact(j?.contacts?.registrant),
+      abuse: {
+        email: cleanStr(reg.abuseEmail),
+        phone: stripTel(cleanStr(reg.abusePhone)),
+      },
+    };
+  } catch (err) {
+    log.warn(`who-dat failed for ${domain}: ${(err as Error).message}`);
+    return null;
+  }
+}
+
+// Last-resort paid fallback when RDAP, port-43 and who-dat all fail.
 async function tryWhoisXml(domain: string): Promise<WhoisResult | null> {
   const apiKey = Deno.env.get("WHOISXML_API_KEY");
   if (!apiKey) return null;
@@ -411,6 +703,7 @@ async function tryWhoisXml(domain: string): Promise<WhoisResult | null> {
     const rec = json?.WhoisRecord ?? {};
     const reg = rec.registryData ?? {};
     const r = reg.registrant ?? rec.registrant ?? {};
+    const whoisServer = cleanStr(reg.whoisServer);
     return {
       domainName: rec.domainName ?? domain,
       status: parseStatusArray(rec.status ?? reg.status),
@@ -421,10 +714,10 @@ async function tryWhoisXml(domain: string): Promise<WhoisResult | null> {
         expiry_date: parseDate(reg.expiresDateNormalized ?? rec.expiresDate),
       },
       registrar: {
-        name: rec.registrarName ?? reg.registrarName ?? null,
-        id: rec.registrarIANAID ?? null,
-        url: reg.whoisServer ? `https://${reg.whoisServer}` : null,
-        registryDomainId: reg.registryDomainId ?? null,
+        name: cleanStr(rec.registrarName ?? reg.registrarName),
+        id: cleanStr(rec.registrarIANAID),
+        url: whoisServer ? `https://${whoisServer}` : null,
+        registryDomainId: cleanStr(reg.registryDomainId),
       },
       whois: {
         name: r.name ?? null,
@@ -446,14 +739,20 @@ async function tryWhoisXml(domain: string): Promise<WhoisResult | null> {
   }
 }
 
-// Resolve WHOIS data for a domain via port-43, then RDAP, then WhoisXML.
-export async function getWhoisInfo(domain: string): Promise<WhoisResult | null> {
-  const trimmed = domain.replace(/^(?:https?:\/\/)?(?:www\.)?/i, "").trim().toLowerCase();
-  if (!trimmed) return null;
+// Resolve WHOIS data via RDAP, then port-43, then who-dat, then WhoisXML.
+export async function getWhoisInfo(
+  domain: string,
+): Promise<WhoisResult | null> {
+  const trimmed = normalizeDomain(domain);
+  if (!trimmed) {
+    log.warn(`Rejecting invalid WHOIS domain: ${domain}`);
+    return null;
+  }
 
   const sources: [string, () => Promise<WhoisResult | null>][] = [
-    ["port-43", () => tryPort43(trimmed)],
     ["rdap", () => tryRdap(trimmed)],
+    ["port-43", () => tryPort43(trimmed)],
+    ["who-dat", () => tryWhoDat(trimmed)],
     ["whoisxml", () => tryWhoisXml(trimmed)],
   ];
 
@@ -468,7 +767,9 @@ export async function getWhoisInfo(domain: string): Promise<WhoisResult | null> 
         if (best.dates.expiry_date && best.registrar.name) return best;
       }
     } catch (err) {
-      log.warn(`Source ${name} threw for ${trimmed}: ${(err as Error).message}`);
+      log.warn(
+        `Source ${name} threw for ${trimmed}: ${(err as Error).message}`,
+      );
     }
   }
   return best;
