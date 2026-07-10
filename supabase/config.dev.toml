@@ -46,6 +46,10 @@ file_size_limit = "50MiB"
 [storage.image_transformation]
 enabled = false
 
+# Vector buckets need paid plan, and CLI defaults this to true if omitted
+[storage.vector]
+enabled = false
+
 [auth]
 enabled = true
 site_url = "https://demo.domain-locker.com"

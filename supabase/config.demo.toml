@@ -35,6 +35,10 @@ port = 54323
 api_url = "http://127.0.0.1"
 
 
+# Vector buckets need paid plan, and CLI defaults this to true if omitted
+[storage.vector]
+enabled = false
+
 [auth]
 enabled = true
 site_url = "https://demo.domain-locker.com"
