@@ -1,13 +1,14 @@
 import { serve } from "../shared/serveWithCors.ts";
 import { getSupabaseClient } from "../shared/supabaseClient.ts";
 import { Monitor } from "../shared/monitor.ts";
+import { one } from "../shared/embedded.ts";
 
 const REMINDER_DAYS = [90, 30, 7, 2];
 
 const monitor = new Monitor("expiration-reminders");
 
 serve(async (req) => {
-  monitor.start(req);
+  await monitor.start(req);
 
   const supabase = getSupabaseClient(req);
   let reminderCount = 0;
@@ -27,7 +28,7 @@ serve(async (req) => {
 
     for (const domain of domains ?? []) {
       const { id: domain_id, domain_name, user_id, registrars } = domain;
-      const registrar = registrars?.name;
+      const registrar = one(registrars)?.name;
 
       const message = `Domain ${domain_name} expiring in ${days} days.` +
         (registrar ? ` Renew it on ${registrar}.` : "");
@@ -47,7 +48,7 @@ serve(async (req) => {
   }
 
   const doneMessage = `Done. ${reminderCount} reminders created.`;
-  monitor.success(doneMessage);
+  await monitor.success(doneMessage);
   return new Response(doneMessage, { status: 200 });
 });
 

@@ -2,6 +2,7 @@ import { serve } from "../shared/serveWithCors.ts";
 
 import { getSupabaseClient } from "../shared/supabaseClient.ts";
 import { Monitor } from "../shared/monitor.ts";
+import { one } from "../shared/embedded.ts";
 
 const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY");
 const RESEND_SENDER = Deno.env.get("RESEND_SENDER") ||
@@ -12,7 +13,7 @@ const APP_BASE_URL = Deno.env.get("DL_BASE_URL") || "https://domain-locker.com";
 const monitor = new Monitor("expiration-invites");
 
 serve(async (req) => {
-  monitor.start(req);
+  await monitor.start(req);
 
   const supabase = getSupabaseClient(req);
 
@@ -40,7 +41,7 @@ serve(async (req) => {
 
   if (!expiring || expiring.length === 0) {
     console.log("✅ No domains expiring in 90 days");
-    monitor.success("No upcoming expirations");
+    await monitor.success("No upcoming expirations");
     return new Response("No upcoming expirations", { status: 200 });
   }
 
@@ -56,8 +57,8 @@ serve(async (req) => {
         continue;
       }
 
-      const registrar = registrars?.name || "your registrar";
-      const registrarUrl = registrars?.url || APP_BASE_URL;
+      const registrar = one(registrars)?.name || "your registrar";
+      const registrarUrl = one(registrars)?.url || APP_BASE_URL;
 
       const title = `🌐 ${domain_name} expiration`;
       const desc = `Heads up! Your domain ${domain_name} is set to expire on ${
@@ -104,21 +105,21 @@ Manage all your domains here: ${APP_BASE_URL}`;
 
       if (!emailRes.ok) {
         const err = await emailRes.json();
-        monitor.fail(
+        await monitor.fail(
           `Failed to send invite for ${domain_name}: ${err.message}`,
         );
         console.error(`❌ Failed to send invite to ${email}:`, err);
         continue;
       }
     } catch (err: any) {
-      monitor.fail(
+      await monitor.fail(
         `Error processing domain ${domain.domain_name}: ${err.message}`,
       );
       console.error("❌ Failed processing domain:", err);
     }
   }
   const resMessage = `Sent ${expiring.length} expiration events`;
-  monitor.success(resMessage);
+  await monitor.success(resMessage);
   return new Response(resMessage, { status: 200 });
 });
 

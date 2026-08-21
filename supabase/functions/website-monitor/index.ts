@@ -86,7 +86,7 @@ async function checkDomainHealth(
 // Main handler
 serve(async (req: Request) => {
   logger.info("🔁 Website monitor function started");
-  monitor.start(req);
+  await monitor.start(req);
   const supabase = getSupabaseClient(req);
 
   try {
@@ -99,7 +99,7 @@ serve(async (req: Request) => {
     if (billingError) {
       const message = `Error fetching billing users: ${billingError.message}`;
       logger.error(message);
-      monitor.fail(`Billing query failed: ${billingError.message}`);
+      await monitor.fail(`Billing query failed: ${billingError.message}`);
       return new Response(
         JSON.stringify({ error: "Billing query failed" }),
         { status: 500, headers: { "Content-Type": "application/json" } },
@@ -108,7 +108,7 @@ serve(async (req: Request) => {
 
     const userIds = (billingData ?? []).map((row: Billing) => row.user_id);
     if (userIds.length === 0) {
-      monitor.fail("No pro users found");
+      await monitor.fail("No pro users found");
       logger.info("No pro users found");
       return new Response(
         JSON.stringify({ message: "User(s) not on pro plan" }),
@@ -124,7 +124,7 @@ serve(async (req: Request) => {
 
     if (domainError) {
       logger.error(`Error fetching domains: ${domainError.message}`);
-      monitor.fail(`Domain query failed: ${domainError.message}`);
+      await monitor.fail(`Domain query failed: ${domainError.message}`);
       return new Response(
         JSON.stringify({ error: "Domain query failed" }),
         { status: 500, headers: { "Content-Type": "application/json" } },
@@ -133,7 +133,7 @@ serve(async (req: Request) => {
 
     if (!domains || domains.length === 0) {
       logger.info("No domains found for pro users");
-      monitor.success("No domains to monitor");
+      await monitor.success("No domains to monitor");
       return new Response(
         JSON.stringify({ message: "No domains to monitor" }),
         { status: 200, headers: { "Content-Type": "application/json" } },
@@ -166,7 +166,7 @@ serve(async (req: Request) => {
 
     if (insertError) {
       logger.error(`Error inserting uptime data: ${insertError.message}`);
-      monitor.fail(`Insert uptime failed: ${insertError.message}`);
+      await monitor.fail(`Insert uptime failed: ${insertError.message}`);
       return new Response(
         JSON.stringify({ error: "Failed to insert uptime" }),
         { status: 500 },
@@ -177,10 +177,10 @@ serve(async (req: Request) => {
       `✅ Website monitor complete – ${results.length} domains checked`;
     logger.info(summary);
     await logger.flushToRemote();
-    monitor.success(summary);
+    await monitor.success(summary);
     return new Response(JSON.stringify({ message: summary }), { status: 200 });
   } catch (err: any) {
-    monitor.fail(`Unhandled error: ${err.message}`);
+    await monitor.fail(`Unhandled error: ${err.message}`);
     logger.error(`Unhandled error: ${err.message}`);
     await logger.flushToRemote();
     return new Response(JSON.stringify({ error: "Internal server error" }), {

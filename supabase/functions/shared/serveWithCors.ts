@@ -18,6 +18,14 @@ function addCorsHeaders(init: ResponseInit = {}): ResponseInit {
   return { ...init, headers };
 }
 
+/* Re-emit a response with CORS headers applied */
+function withCors(res: Response): Response {
+  return new Response(res.body, addCorsHeaders({
+    status: res.status,
+    headers: res.headers,
+  }));
+}
+
 /* Drop-in replacement for `serve` with built-in CORS & error handling */
 export function serve(
   handler: (req: Request) => Promise<Response>,
@@ -40,19 +48,14 @@ export function serve(
     }
 
     try {
-      const res = await handler(req);
-      // Ensure headers are applied to using .clone()
-      return new Response(
-        res.body,
-        addCorsHeaders({
-          status: res.status,
-          headers: res.headers,
-        }),
-      );
-    } catch (err: any) {
+      return withCors(await handler(req));
+    } catch (err: unknown) {
+      // Handlers signal client errors by throwing a Response, so honour it
+      if (err instanceof Response) return withCors(err);
+
       logger.error(
         `Uncaught error while serving: ${
-          err?.message || err || "mystery error"
+          (err as Error)?.message || err || "mystery error"
         }`,
       );
       return new Response(

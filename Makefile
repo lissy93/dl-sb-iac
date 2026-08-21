@@ -1,4 +1,4 @@
-.PHONY: all seed secrets config schema functions deploy
+.PHONY: all seed secrets config schema functions deploy check test
 
 # Define variables for commands to avoid repetition
 SUPABASE=npx supabase
@@ -21,6 +21,14 @@ schema:
 	@echo "🚀 Deploying database schema"
 	@$(SUPABASE) db push
 
+check:
+	@echo "🔎 Type-checking Edge Functions"
+	@deno check supabase/functions/*/index.ts
+
+test:
+	@echo "🧪 Running tests"
+	@deno test --allow-net --allow-env tests/
+
 functions:
 	@echo "⚡ Deploying Edge Functions"
 	@$(SUPABASE) functions deploy
@@ -35,5 +43,7 @@ help:
 	@echo "  config    - Apply configuration"
 	@echo "  schema    - Deploy database schema"
 	@echo "  functions - Deploy Edge Functions"
+	@echo "  check     - Type-check Edge Functions"
+	@echo "  test      - Run tests"
 	@echo "  deploy    - Run schema, seed, functions, secrets, and config targets"
 	@echo "  help      - Show this help message"

@@ -89,19 +89,26 @@ async function processJob(
     });
     if (!res.ok) throw new Error(`updater returned ${res.status}: ${await res.text()}`);
 
+    // Reset attempts so the counter tracks consecutive failures, not lifetime runs
     await supabase
       .from('domain_update_jobs')
-      .update({ status: 'complete', last_updated_at: new Date().toISOString() })
+      .update({
+        status: 'complete',
+        last_updated_at: new Date().toISOString(),
+        attempts: 0,
+        last_error: null,
+      })
       .eq('domain', domain)
       .eq('user_id', userId);
     return true;
   } catch (err) {
+    const message = (err as Error)?.message || String(err ?? 'Unknown error');
     await supabase
       .from('domain_update_jobs')
-      .update({ status: 'failed' })
+      .update({ status: 'failed', last_error: message.slice(0, 500) })
       .eq('domain', domain)
       .eq('user_id', userId);
-    logger.warn(`Job failed: ${domain} - ${(err as Error).message}`);
+    logger.warn(`Job failed: ${domain} - ${message}`);
     return false;
   }
 }

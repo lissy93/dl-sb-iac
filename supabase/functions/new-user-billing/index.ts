@@ -352,7 +352,7 @@ async function setupUserBilling(
  * Supabase Edge Function: Handles user signup events and manual re-checks.
  */
 serve(async (req) => {
-  monitor.start(req);
+  await monitor.start(req);
   const supabase = getSupabaseClient(req);
 
   try {

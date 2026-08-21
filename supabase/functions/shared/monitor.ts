@@ -3,8 +3,9 @@
  * Integrates with healthchecks.io and GlitchTip for simple
  * monitoring of job status and error reporting.
  */
+import { Logger } from "./logger.ts";
 
-const enabledMonitors = [
+const MONITORED_JOBS = [
   "trigger-updates",
   "expiration-invites",
   "expiration-reminders",
@@ -15,125 +16,113 @@ const enabledMonitors = [
   "domain-update-batcher",
 ];
 
+// healthchecks.io orders events by arrival, so pings are spaced to stay in sequence
+const MIN_PING_GAP_MS = 150;
+const PING_TIMEOUT_MS = 5000;
+
+type PingType = "start" | "fail" | "success";
+
 export interface MonitorOptions {
   healthcheckUrl?: string; // healthchecks.io UUID ping URL
   glitchtipUrl?: string; // GlitchTip endpoint (optional)
   glitchtipToken?: string; // GlitchTip auth token (optional)
-  jobName?: string; // Optional label for logs
-  notifyOnStart?: boolean; // Whether to ping "start" at beginning
-  cronHeader?: string; // Header to check for cron runs
+  cronHeader?: string; // Header marking a run as cron-triggered
 }
 
 export class Monitor {
-  private healthcheckUrl?: string;
-  private glitchtipUrl?: string;
-  private glitchtipToken?: string;
-  private jobName?: string;
-  private enabled: boolean = false;
-  private cronHeader: string = "X-Cron-Run";
-  private startTime?: number;
+  private readonly logger: Logger;
+  private readonly jobName: string;
+  private readonly monitored: boolean;
+  private readonly cronHeader: string;
+  private readonly healthcheckUrl?: string;
+  private readonly glitchtipUrl?: string;
+  private readonly glitchtipToken?: string;
+  private enabled = false;
+  private pingChain: Promise<void> = Promise.resolve();
+  private lastPingAt = 0;
 
   constructor(jobName: string, opts: MonitorOptions = {}) {
     this.jobName = jobName;
-    this.healthcheckUrl = opts.healthcheckUrl || Deno.env.get("HC_URL");
-    this.glitchtipUrl = opts.glitchtipUrl || Deno.env.get("GLITCHTIP_URL");
-    this.glitchtipToken = opts.glitchtipToken ||
-      Deno.env.get("GLITCHTIP_TOKEN");
-    this.enabled = enabledMonitors.includes(jobName);
-    this.cronHeader = opts.cronHeader || "X-Cron-Run";
-
-    if (opts.notifyOnStart) {
-      this.ping("start");
-    }
+    this.logger = new Logger(jobName);
+    this.monitored = MONITORED_JOBS.includes(jobName);
+    this.cronHeader = opts.cronHeader ?? "X-Cron-Run";
+    this.healthcheckUrl = opts.healthcheckUrl ?? Deno.env.get("HC_URL");
+    this.glitchtipUrl = opts.glitchtipUrl ?? Deno.env.get("GLITCHTIP_URL");
+    this.glitchtipToken = opts.glitchtipToken ?? Deno.env.get("GLITCHTIP_TOKEN");
   }
 
-  // Log info and ping success endpoint
-  public async success(msg = "Job completed successfully") {
-    console.info(`✅ [${this.jobName}] ${msg}`);
-    await this.ping("success", msg); // default = success
+  /** Begin a run; only cron-triggered runs are reported to healthchecks.io */
+  public start(req?: Request): Promise<void> {
+    this.enabled = this.monitored &&
+      req?.headers.get(this.cronHeader) === "true";
+    this.logger.info("Job started");
+    return this.ping("start");
   }
 
-  // Log error, send to glitchtip, ping fail endpoint
-  public async fail(error: any, context: Record<string, any> = {}) {
-    const errMessage = error?.message || "Unknown error";
-    console.error(`❌ [${this.jobName}] ${errMessage}`);
+  /** Log and report a successful run */
+  public success(msg = "Job completed successfully"): Promise<void> {
+    this.logger.success(msg);
+    return this.ping("success", msg);
+  }
+
+  /** Log the error, report it to GlitchTip, then signal failure */
+  public async fail(error: unknown, context: Record<string, unknown> = {}) {
+    this.logger.error(errMessage(error));
     if (this.glitchtipUrl && this.glitchtipToken) {
-      this.sendToGlitchTip(error, context);
+      await this.sendToGlitchTip(error, context);
     }
     await this.ping("fail");
   }
 
-  private isCronRun(req?: Request): boolean {
-    return req?.headers.get(this.cronHeader) === "true";
+  /** Queue a ping behind any in-flight one, so events arrive in order */
+  private ping(type: PingType, message?: string): Promise<void> {
+    if (!this.healthcheckUrl || !this.enabled) return Promise.resolve();
+    this.pingChain = this.pingChain.then(() => this.sendPing(type, message));
+    return this.pingChain;
   }
 
-  public start(req?: Request) {
-    if (!this.isCronRun(req)) {
-      this.enabled = false;
+  /** Send one ping, spaced from the previous. Never throws, to keep the chain alive */
+  private async sendPing(type: PingType, message?: string): Promise<void> {
+    const sinceLast = Date.now() - this.lastPingAt;
+    if (this.lastPingAt && sinceLast < MIN_PING_GAP_MS) {
+      await delay(MIN_PING_GAP_MS - sinceLast);
     }
-    this.startTime = Date.now();
-    console.info(`🔄 [${this.jobName}] Job started`);
-    this.ping("start");
+
+    const isSuccess = type === "success";
+    const url = `${this.healthcheckUrl}/${this.jobName}` +
+      (isSuccess ? "" : `/${type}`);
+
+    try {
+      const res = await fetch(url, {
+        method: isSuccess ? "POST" : "GET",
+        headers: isSuccess ? { "Content-Type": "text/plain" } : undefined,
+        body: isSuccess ? message ?? "" : undefined,
+        signal: AbortSignal.timeout(PING_TIMEOUT_MS),
+      });
+      await res.body?.cancel();
+    } catch (err) {
+      this.logger.warn(`Healthcheck ${type} ping failed: ${errMessage(err)}`);
+    } finally {
+      this.lastPingAt = Date.now();
+    }
   }
 
-  // Ping healthchecks.io
-  private async ping(type?: "start" | "fail" | "success", message?: string) {
-    if (!this.healthcheckUrl) return;
-    if (!this.enabled) return;
-
-    // Add delay if job completed too quickly (< 200ms) to prevent race condition
-    if ((type === "success" || type === "fail") && this.startTime) {
-      const elapsed = Date.now() - this.startTime;
-      if (elapsed < 200) {
-        await new Promise((resolve) => setTimeout(resolve, 100));
-      }
-    }
-
-    let url = `${this.healthcheckUrl}/${this.jobName}`;
-
-    let method: "GET" | "POST" = "GET";
-    let body: string | undefined;
-
-    // Use GET for start/fail; POST only for success with logs
-    if (type === "start") {
-      url += "/start";
-    } else if (type === "fail") {
-      url += "/fail";
-    } else {
-      method = "POST";
-      body = message || "";
-    }
-
-    console.log(
-      `🔗 [${this.jobName}] Pinging healthcheck: ${url} (${type || "success"})`,
-    );
-    fetch(url, {
-      method,
-      headers: method === "POST" ? { "Content-Type": "text/plain" } : undefined,
-      body,
-    }).catch((e) => {
-      console.warn(
-        `⚠️ [${this.jobName}] Healthcheck ping (${type || "success"}) failed:`,
-        e,
-      );
-    });
-  }
-
-  // Send structured error report to GlitchTip (or Sentry-compatible)
-  private async sendToGlitchTip(error: any, context: Record<string, any>) {
+  /** Send a structured error report to GlitchTip (or any Sentry-compatible sink) */
+  private async sendToGlitchTip(error: unknown, context: Record<string, unknown>) {
+    const err = error as Error;
     const body = {
       exception: {
         values: [{
-          type: error?.name || "Error",
-          value: error?.message || "Unknown Error",
+          type: err?.name ?? "Error",
+          value: errMessage(error),
           stacktrace: {
-            frames: (error?.stack || "").split("\n").map((line: string) => ({
+            frames: (err?.stack ?? "").split("\n").map((line: string) => ({
               function: line.trim(),
             })),
           },
         }],
       },
-      message: error?.message,
+      message: errMessage(error),
       level: "error",
       platform: "javascript",
       timestamp: Math.floor(Date.now() / 1000),
@@ -142,16 +131,26 @@ export class Monitor {
     };
 
     try {
-      await fetch(this.glitchtipUrl!, {
+      const res = await fetch(this.glitchtipUrl!, {
         method: "POST",
         headers: {
-          "Authorization": `Bearer ${this.glitchtipToken}`,
+          Authorization: `Bearer ${this.glitchtipToken}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify(body),
+        signal: AbortSignal.timeout(PING_TIMEOUT_MS),
       });
+      await res.body?.cancel();
     } catch (err) {
-      console.warn(`⚠️ [${this.jobName}] GlitchTip reporting failed:`, err);
+      this.logger.warn(`GlitchTip reporting failed: ${errMessage(err)}`);
     }
   }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function errMessage(error: unknown): string {
+  return (error as Error)?.message || String(error ?? "") || "Unknown error";
 }

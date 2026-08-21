@@ -1,10 +1,10 @@
 
-       ____                        _         _               _             
-      |  _ \  ___  _ __ ___   __ _(_)_ __   | |    ___   ___| | _____ _ __ 
+       ____                        _         _               _
+      |  _ \  ___  _ __ ___   __ _(_)_ __   | |    ___   ___| | _____ _ __
       | | | |/ _ \| '_ ` _ \ / _` | | '_ \  | |   / _ \ / __| |/ / _ \ '__|
-      | |_| | (_) | | | | | | (_| | | | | | | |__| (_) | (__|   <  __/ |   
-      |____/ \___/|_| |_| |_|\__,_|_|_| |_| |_____\___/ \___|_|\_\___|_|   
-                                                                           
+      | |_| | (_) | | | | | | (_| | | | | | | |__| (_) | (__|   <  __/ |
+      |____/ \___/|_| |_| |_|\__,_|_|_| |_| |_____\___/ \___|_|\_\___|_|
+
 
 >> This repo contains the config, schema and edge functions for Domain Locker <<
 >> For the main project and app, see https://github.com/lissy93/domain-locker <<
@@ -55,7 +55,7 @@ supabase functions deploy       # Deploy functions
 
 See the `Makefile` for all deployment commands.
 
-The easiest way to deploy is via GitHub Actions, which we use for CI/CD. 
+The easiest way to deploy is via GitHub Actions, which we use for CI/CD.
 Just push to main or trigger the supabase.yml workflow, and it will deploy
 
 You'll need to configure the following GitHub secrets to authenticate:
@@ -147,6 +147,11 @@ API Endpoints:
   AS93_DOMAIN_INFO_URL  - The URL to our external domain info API
   AS93_DOMAIN_INFO_KEY  - And the key for the domain info API
   AS93_SPONSORS_API     - The URL to our GitHub sponsors API
+
+WHOIS Fallbacks (all optional):
+  WHO_DAT_URL      - Who-Dat instance URL (default: https://who-dat.as93.net)
+  WHO_DAT_API_KEY  - Sent as x-api-key to Who-Dat, so you can skip rate limit
+  WHOISXML_API_KEY - Enables WhoisXML API as a last-resort paid fallback
 
 Worker Endpoints:
   WORKER_DOMAIN_UPDATER_URL - The URL to domain-updater function
