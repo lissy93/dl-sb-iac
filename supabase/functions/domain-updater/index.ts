@@ -205,13 +205,18 @@ async function recordChange(
   }
 }
 
-// Resolve registrar by name, inserting a new row if needed; returns id or null.
+// Resolve the user's registrar by name, inserting a row if needed; returns id or null.
 async function resolveRegistrarId(ctx: Ctx, name: string, url: string | null) {
-  const { data: existing } = await ctx.sb.from("registrars")
-    .select("id").ilike("name", name).maybeSingle();
+  const { data: existing, error: lookupError } = await ctx.sb.from("registrars")
+    .select("id").eq("user_id", ctx.userId).ilike("name", name)
+    .limit(1).maybeSingle();
+  if (lookupError) {
+    logger.error(`Failed to look up registrar ${name}: ${lookupError.message}`);
+    return null;
+  }
   if (existing) return existing.id as string;
   const { data: created, error } = await ctx.sb.from("registrars")
-    .insert({ name, url }).select("id").single();
+    .insert({ name, url, user_id: ctx.userId }).select("id").single();
   if (error) {
     logger.error(`Failed to insert registrar ${name}: ${error.message}`);
     return null;
@@ -236,16 +241,19 @@ async function syncRegistrar(ctx: Ctx, info: any, current: any) {
   const newName = info.registrar?.name;
   const currentName = current.registrars?.name ?? null;
   if (!registrarChanged(currentName, newName)) return;
-  await recordChange(ctx, "updated", "registrar", currentName, newName);
   const registrarId = await resolveRegistrarId(
     ctx,
     newName,
     info.registrar?.url ?? null,
   );
-  if (registrarId) {
-    await ctx.sb.from("domains").update({ registrar_id: registrarId })
-      .eq("id", ctx.domainId);
+  if (!registrarId) return;
+  const { error } = await ctx.sb.from("domains")
+    .update({ registrar_id: registrarId }).eq("id", ctx.domainId);
+  if (error) {
+    logger.error(`Failed to set registrar on ${ctx.domainId}: ${error.message}`);
+    return;
   }
+  await recordChange(ctx, "updated", "registrar", currentName, newName);
 }
 
 const WHOIS_FIELDS = [

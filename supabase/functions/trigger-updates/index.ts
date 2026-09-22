@@ -19,12 +19,12 @@ if (!DB_URL) {
 const DOMAIN_UPDATER_URL = Deno.env.get("WORKER_DOMAIN_UPDATER_URL") ??
   `${DB_URL}/functions/v1/domain-updater`;
 
-// Helper function to call the domain updater for a specific domain and user
+// Call the domain updater for one domain and user; true when it reported success
 async function updateDomainForUser(
   domain: string,
   userId: string,
   req: Request,
-) {
+): Promise<boolean> {
   try {
     const jwt = req.headers.get("Authorization")?.replace("Bearer ", "");
     const response = await fetch(DOMAIN_UPDATER_URL, {
@@ -40,29 +40,32 @@ async function updateDomainForUser(
     const responseBody = await response.json();
     console.info(responseBody.message);
 
-    if (responseBody.error) {
-      console.error("❌", responseBody.error);
-    } else if (!response.ok) {
-      console.error("❌", response.statusText);
+    if (responseBody.error || !response.ok) {
+      console.error("❌", responseBody.error ?? response.statusText);
+      return false;
     }
+    return true;
   } catch (error) {
     console.error("❌", (error as Error).message);
+    return false;
   }
 }
 
 const BATCH_SIZE = Number(Deno.env.get("TRIGGER_UPDATES_BATCH_SIZE") ?? 10);
 
-// Process a batch of domains concurrently, bounded by BATCH_SIZE.
+// Process a batch of domains concurrently, bounded by BATCH_SIZE; returns failures
 async function processBatch(
   batch: { domain_name: string; user_id: string }[],
   req: Request,
-) {
-  await Promise.allSettled(
+): Promise<number> {
+  const results = await Promise.all(
     batch.map((d) => updateDomainForUser(d.domain_name, d.user_id, req)),
   );
+  return results.filter((ok) => !ok).length;
 }
 
 // Process every domain in batches; parallel within a batch, sequential between.
+// Partial failures are reported in the summary, total failure fails the run.
 async function processAllDomains(req: Request) {
   const supabase = getSupabaseClient(req);
   const startTime = performance.now();
@@ -75,12 +78,18 @@ async function processAllDomains(req: Request) {
     throw new Error("Error fetching domains");
   }
 
+  let failed = 0;
   for (let i = 0; i < domains.length; i += BATCH_SIZE) {
-    await processBatch(domains.slice(i, i + BATCH_SIZE), req);
+    failed += await processBatch(domains.slice(i, i + BATCH_SIZE), req);
   }
 
   const duration = ((performance.now() - startTime) / 1000).toFixed(1);
-  return `✅ ${domains.length} domains processed successfully in ${duration} seconds`;
+  const summary = `${domains.length - failed} of ${domains.length} domains updated` +
+    (failed ? `, ${failed} failed` : "") + ` in ${duration} seconds`;
+  if (domains.length && failed === domains.length) {
+    throw new Error(`❌ ${summary}`);
+  }
+  return `${failed ? "⚠️" : "✅"} ${summary}`;
 }
 
 // Supabase serverless function handler
