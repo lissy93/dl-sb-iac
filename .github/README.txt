@@ -130,8 +130,7 @@ Config:
 
 Monitoring:
   HC_URL - The URL to the Healthcheck service
-  GLITCHTIP_URL - URL to your GlitchTip/Sentry instance
-  GLITCHTIP_TOKEN - DSN token for GlitchTip/Sentry
+  GLITCHTIP_DSN - Project DSN for GlitchTip/Sentry error reporting
   LOGFLARE_ENDPOINT_URL - The Logflare endpoint URL
   DL_LOGGING_ENABLED - Enable or disable logging
 
