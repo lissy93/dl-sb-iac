@@ -1,6 +1,12 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import Stripe from "https://esm.sh/stripe@11.15.0?target=deno";
+import { Monitor } from "../shared/monitor.ts";
+import {
+  listPayingSubscriptions,
+  PAID_PLANS,
+  PLAN_MAPPING,
+} from "../shared/stripe.ts";
 
 // === 1) Initialize Supabase ===
 const DB_URL = Deno.env.get("DB_URL") || "";
@@ -14,33 +20,32 @@ const stripeSecretKey = Deno.env.get("STRIPE_SECRET_KEY") || "";
 const webhookSecret = Deno.env.get("STRIPE_WEBHOOK_SECRET") || "";
 const stripe = new Stripe(stripeSecretKey, { apiVersion: "2024-11-20.acacia" });
 
-// === 3) Plan Mapping ===
-const PLAN_MAPPING: Record<string, string> = {
-  "dl_hobby_monthly": "hobby",
-  "dl_hobby_annual": "hobby",
-  "dl_pro_monthly": "pro",
-  "dl_pro_annual": "pro",
-};
+// Reports anything needing attention to GlitchTip, when GLITCHTIP_DSN is set
+const monitor = new Monitor("stripe-webhook");
 
-// === 4) Serve Webhook ===
+// === 3) Serve Webhook ===
 serve(async (req: Request) => {
   if (!DB_URL || !DB_KEY || !stripeSecretKey || !webhookSecret) {
     return respError("Missing environment variables", 500);
   }
 
+  let event: Stripe.Event | undefined;
   try {
     // Verify Stripe webhook signature
     const signature = req.headers.get("stripe-signature");
-    if (!signature) throw new Error("Missing stripe-signature header");
+    if (!signature) return respError("Missing stripe-signature header", 400);
 
     const rawBody = await req.text();
-    let event;
     try {
       event = stripe.webhooks.constructEvent(rawBody, signature, webhookSecret);
     } catch (err) {
       logError("Webhook signature verification failed", err);
+      await monitor.warn(
+        "Stripe webhook signature check failed, check STRIPE_WEBHOOK_SECRET",
+      );
       return respError("Invalid signature", 400);
     }
+    logInfo(`Received ${event.type}`, { eventId: event.id });
 
     // Route based on event type
     switch (event.type) {
@@ -60,12 +65,13 @@ serve(async (req: Request) => {
 
       default:
         logInfo(`Unhandled event type: ${event.type}`);
-        return respError("Unexpected event", 400);
     }
 
     return respSuccess();
   } catch (err: any) {
+    // A non-2xx makes Stripe retry, for up to 3 days
     logError("Webhook error:", err);
+    await monitor.fail(err, { eventId: event?.id, eventType: event?.type });
     return respError(err.message || "Unknown error", 400);
   }
 });
@@ -82,6 +88,10 @@ async function handleSubscriptionUpdated(event: any) {
 
   if (!userId) {
     logError(`${event.type}: No user_id in subscription metadata`, { invoice });
+    await monitor.warn(`${event.type} has no user_id, so no plan was changed`, {
+      eventId: event.id,
+      customer: invoice.customer,
+    });
     return;
   }
 
@@ -114,6 +124,14 @@ async function handleSubscriptionUpdated(event: any) {
     return;
   }
 
+  // A credit-only invoice, like the refund when canceling, never grants a plan
+  if (
+    invoice.lines?.data?.every((item: { amount: number }) => item.amount < 0)
+  ) {
+    logInfo(`Ignoring credit-only invoice for user ${userId}`);
+    return;
+  }
+
   // Otherwise, always update billing record (err on the side of caution)
   logInfo(`Processing invoice for user ${userId}, reason: ${billingReason}`);
   await updateBillingRecord(userId, invoice);
@@ -135,6 +153,12 @@ async function handlePaymentFailed(event: any) {
     return;
   }
 
+  await monitor.warn("A subscriber's payment failed", {
+    userId,
+    invoice: invoice.id,
+    attempt: invoice.attempt_count,
+    nextAttempt: invoice.next_payment_attempt,
+  });
   sendEmail(userId, "payment_failed");
 }
 
@@ -149,6 +173,30 @@ async function handleSubscriptionDeleted(event: any) {
     logError("customer.subscription.deleted: No user_id found in metadata", {
       subscription,
     });
+    await monitor.warn(
+      "Canceled subscription has no user_id, so no one was downgraded",
+      {
+        eventId: event.id,
+        customer: subscription.customer,
+      },
+    );
+    return;
+  }
+
+  // A customer with another paying subscription keeps that plan instead
+  const [remaining] = await listPayingSubscriptions({
+    customer: subscription.customer as string,
+  });
+  if (remaining) {
+    await monitor.warn(
+      "User canceled a subscription but still pays for another, so kept that plan",
+      {
+        userId,
+        canceled: subscription.id,
+        remaining: remaining.id,
+      },
+    );
+    await updateBillingRecord(userId, remaining);
     return;
   }
 
@@ -192,12 +240,25 @@ async function updateBillingRecord(userId: string, eventObject: any) {
     return;
   }
 
-  // 4️⃣ Extract plan information from items
-  const priceId = items[0]?.price.lookup_key;
-  const plan = PLAN_MAPPING[priceId] || "free";
+  // 4️⃣ Extract plan, on plan switches the first line is the credit for the old plan
+  const line =
+    items.find((item: { amount?: number }) => (item.amount ?? 0) > 0) ??
+      items[0];
+  const priceId = line.price?.lookup_key;
+  const plan = PLAN_MAPPING[priceId];
+  if (!plan) {
+    await monitor.warn(
+      `Unrecognised Stripe price ${priceId}, so no plan was changed`,
+      {
+        userId,
+        customer: eventObject.customer,
+      },
+    );
+    return;
+  }
 
   // 5️⃣ Get next payment due date (if applicable)
-  const periodEnd = eventObject.current_period_end || items[0]?.period.end;
+  const periodEnd = eventObject.current_period_end || line.period?.end;
   const nextPaymentDue = periodEnd
     ? new Date(periodEnd * 1000).toISOString()
     : null;
@@ -231,30 +292,33 @@ async function updateBillingRecord(userId: string, eventObject: any) {
     );
 
   if (error) {
-    logError("Failed to update billing", { error, userId, plan });
-  } else {
-    logInfo("Billing updated successfully", { userId, plan });
+    throw new Error(`Failed to set ${userId} to ${plan}: ${error.message}`);
   }
+  logInfo("Billing updated successfully", { userId, plan });
 }
 
 /**
- * Downgrades a user to the free plan
+ * Downgrades a user on a paid plan to free, leaving hand-set plans alone
  */
 async function downgradeToFreePlan(userId: string) {
-  const { error } = await supabase
+  const { data, error } = await supabase
     .from("billing")
     .update({
       current_plan: "free",
       next_payment_due: null,
       updated_at: new Date().toISOString(),
     })
-    .eq("user_id", userId);
+    .eq("user_id", userId)
+    .in("current_plan", PAID_PLANS)
+    .select("user_id");
 
   if (error) {
-    logError("Failed to downgrade user to free", { error, userId });
-  } else {
-    logInfo("User downgraded to free plan", { userId });
+    throw new Error(`Failed to downgrade ${userId}: ${error.message}`);
   }
+  logInfo(
+    data.length ? "User downgraded to free plan" : "User not on a paid plan",
+    { userId },
+  );
 }
 
 /**

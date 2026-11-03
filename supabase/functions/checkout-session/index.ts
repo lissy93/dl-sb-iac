@@ -1,5 +1,14 @@
 import { serve } from "../shared/serveWithCors.ts";
-import { getSupabaseClient } from "../shared/supabaseClient.ts";
+import { getSupabaseClient, getUserOrNull } from "../shared/supabaseClient.ts";
+import { Monitor } from "../shared/monitor.ts";
+import {
+  listPayingSubscriptions,
+  type StripeSubscription,
+} from "../shared/stripe.ts";
+
+const STRIPE_API = "https://api.stripe.com/v1";
+
+const monitor = new Monitor("checkout-session");
 
 /** Helper to get env var, or fallback, or throw error. */
 function getEnvVar(name: string, fallback?: string): string {
@@ -28,6 +37,57 @@ function flattenObject(obj: any): Record<string, string> {
   }
   flatten(obj);
   return result;
+}
+
+/** Calls the Stripe API, throwing with Stripe's own message on failure */
+async function stripeRequest(
+  secretKey: string,
+  path: string,
+  body?: Record<string, unknown>,
+) {
+  const res = await fetch(`${STRIPE_API}/${path}`, {
+    method: body ? "POST" : "GET",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Authorization": `Bearer ${secretKey}`,
+    },
+    body: body && new URLSearchParams(flattenObject(body)).toString(),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(`Stripe Error: ${data?.error?.message ?? res.status}`);
+  }
+  return data;
+}
+
+/** Sends a subscriber to Stripe's portal to confirm a switch to the new price */
+async function createPlanSwitchUrl(
+  secretKey: string,
+  subscription: StripeSubscription,
+  priceId: string,
+  successUrl: string,
+  cancelUrl: string,
+): Promise<string> {
+  const item = subscription.items.data[0];
+  const portal = await stripeRequest(secretKey, "billing_portal/sessions", {
+    customer: subscription.customer,
+    return_url: cancelUrl,
+    flow_data: {
+      type: "subscription_update_confirm",
+      subscription_update_confirm: {
+        subscription: subscription.id,
+        items: [{ id: item.id, price: priceId, quantity: 1 }],
+      },
+      after_completion: {
+        type: "redirect",
+        redirect: { return_url: successUrl },
+      },
+    },
+  });
+  console.info(
+    `🔀 Switching ${subscription.customer} from ${item.price.lookup_key} to ${priceId}`,
+  );
+  return portal.url;
 }
 
 /** productId -> env var name => actual Stripe price ID */
@@ -80,13 +140,22 @@ serve(async (req: Request) => {
       });
     }
 
-    const { userId, productId, callbackUrl } = body || {};
-    if (!userId || !productId) {
+    const { productId, callbackUrl } = body || {};
+    if (!productId) {
       return new Response(
-        JSON.stringify({ error: "Missing required fields: userId, productId" }),
+        JSON.stringify({ error: "Missing required field: productId" }),
         { headers: responseHeaders, status: 400 },
       );
     }
+
+    const user = await getUserOrNull(req);
+    if (!user) {
+      return new Response(
+        JSON.stringify({ error: "Please sign in again to upgrade" }),
+        { headers: responseHeaders, status: 401 },
+      );
+    }
+    const userId = user.id;
 
     // 3) Map productId -> env var -> actual Stripe price ID
     const envVarName = productIdToEnvVar[productId];
@@ -111,25 +180,45 @@ serve(async (req: Request) => {
     const line_items = [{ price: priceId, quantity: 1 }];
 
     const subscription_data = { metadata: { user_id: userId } };
-    let customerId = null;
+    const { data: billing, error: billingError } = await supabase
+      .from("billing")
+      .select("meta")
+      .eq("user_id", userId)
+      .maybeSingle();
+    if (billingError) {
+      throw new Error(
+        `Couldn't read billing for ${userId}: ${billingError.message}`,
+      );
+    }
 
-    try {
-      const { data: billing } = await supabase
-        .from("billing")
-        .select("meta")
-        .eq("user_id", userId)
-        .maybeSingle();
+    const customerId = billing?.meta?.customer ?? null;
+    if (customerId) {
+      console.info(`✅ Using existing Stripe customer: ${customerId}`);
+    }
 
-      const existingCustomerId = billing?.meta?.customer;
-
-      if (existingCustomerId) {
-        customerId = existingCustomerId;
-        console.info(
-          `✅ Using existing Stripe customer: ${existingCustomerId}`,
-        );
-      }
-    } catch (err) {
-      console.error("Error fetching customer ID", err);
+    // Existing subscribers switch plan, rather than starting a second subscription
+    const subscriptions = customerId
+      ? await listPayingSubscriptions({ customer: customerId })
+      : [];
+    const subscription = subscriptions.find((sub) => !sub.cancel_at_period_end);
+    if (subscription?.items.data[0].price.id === priceId) {
+      return new Response(
+        JSON.stringify({ error: "You're already on this plan" }),
+        { headers: responseHeaders, status: 400 },
+      );
+    }
+    if (subscription) {
+      const url = await createPlanSwitchUrl(
+        STRIPE_SECRET_KEY,
+        subscription,
+        priceId,
+        finalSuccessUrl,
+        finalCancelUrl,
+      );
+      return new Response(JSON.stringify({ url }), {
+        headers: responseHeaders,
+        status: 200,
+      });
     }
 
     const payload: any = {
@@ -164,6 +253,10 @@ serve(async (req: Request) => {
     if (!stripeRes.ok || !data?.url) {
       const msg = data?.error?.message || data?.error ||
         "Failed to create checkout session";
+      await monitor.fail(new Error(`Checkout failed: ${msg}`), {
+        userId,
+        productId,
+      });
       return new Response(
         JSON.stringify({ error: `Stripe Error: ${msg}` }),
         { headers: responseHeaders, status: 400 },
@@ -178,6 +271,7 @@ serve(async (req: Request) => {
   } catch (err: any) {
     // If any environment var missing or logic error
     console.error("checkout-session error:", err);
+    await monitor.fail(err);
     return new Response(
       JSON.stringify({ error: err.message }),
       { headers: responseHeaders, status: 400 },
