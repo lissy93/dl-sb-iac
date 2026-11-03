@@ -124,6 +124,14 @@ async function handleSubscriptionUpdated(event: any) {
     return;
   }
 
+  // A credit-only invoice, like the refund when canceling, never grants a plan
+  if (
+    invoice.lines?.data?.every((item: { amount: number }) => item.amount < 0)
+  ) {
+    logInfo(`Ignoring credit-only invoice for user ${userId}`);
+    return;
+  }
+
   // Otherwise, always update billing record (err on the side of caution)
   logInfo(`Processing invoice for user ${userId}, reason: ${billingReason}`);
   await updateBillingRecord(userId, invoice);

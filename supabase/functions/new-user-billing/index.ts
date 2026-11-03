@@ -70,7 +70,9 @@ async function fetchGitHubSponsors(): Promise<Set<string>> {
   const sponsors = await res.json();
   if (!sponsors.length) throw new Error("GitHub sponsors API returned none");
   return new Set(
-    sponsors.map((s: { login: string }) => (s.login || "").toLowerCase()),
+    sponsors
+      .filter((s: { login?: string }) => s.login)
+      .map((s: { login: string }) => s.login.toLowerCase()),
   );
 }
 
@@ -318,15 +320,16 @@ async function listBillingRows(
   supabase: Supabase,
 ): Promise<Map<string, BillingRow>> {
   const rows = new Map<string, BillingRow>();
-  for (;;) {
+  for (let offset = 0;;) {
     const { data, error } = await supabase
       .from("billing")
       .select("user_id, current_plan, meta")
       .order("user_id")
-      .range(rows.size, rows.size + 999);
+      .range(offset, offset + 999);
     if (error) throw error;
     if (!data.length) return rows;
     data.forEach((row) => rows.set(row.user_id, row));
+    offset += data.length;
   }
 }
 
@@ -344,10 +347,7 @@ async function syncAllUsers(supabase: Supabase) {
     fetchGitHubSponsors(),
   ]);
 
-  // Pro comes first then newest, and the first one seen for a user wins
-  const isPro = (sub: StripeSubscription) =>
-    PLAN_MAPPING[sub.items.data[0]?.price?.lookup_key ?? ""] === "pro";
-  subscriptions.sort((a, b) => Number(isPro(b)) - Number(isPro(a)));
+  // The first subscription seen for a user wins, so Pro beats Hobby
   const byUser = new Map<string, StripeSubscription>();
   const byCustomer = new Map<string, StripeSubscription>();
   for (const sub of subscriptions) {
@@ -375,10 +375,16 @@ async function syncAllUsers(supabase: Supabase) {
     };
     try {
       const plan = pickPlan(subscription, sponsors.has(githubUsername(user)));
-      const outcome = await savePlan(supabase, user.id, row, plan, null);
+      const outcome = await savePlan(
+        supabase,
+        user.id,
+        row,
+        plan,
+        subscription?.customer ?? null,
+      );
       counts[outcome]++;
       const previous = row?.current_plan;
-      if (outcome === "changed") {
+      if (outcome === "changed" && plan !== previous) {
         await monitor.warn(
           `Daily check moved a user from ${previous} to ${plan}`,
           context,

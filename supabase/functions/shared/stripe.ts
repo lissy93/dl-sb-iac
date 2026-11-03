@@ -26,7 +26,7 @@ export interface StripeSubscription {
   };
 }
 
-/** Every paying Stripe subscription matching the filters, newest first */
+/** Every paying Stripe subscription matching the filters, Pro first then newest */
 export async function listPayingSubscriptions(
   filters: Record<string, string> = {},
 ): Promise<StripeSubscription[]> {
@@ -49,5 +49,9 @@ export async function listPayingSubscriptions(
     subscriptions.push(...page.data);
     startingAfter = page.has_more ? page.data.at(-1).id : "";
   } while (startingAfter);
-  return subscriptions.filter((sub) => PAYING_STATUSES.includes(sub.status));
+  const isPro = (sub: StripeSubscription) =>
+    Number(PLAN_MAPPING[sub.items.data[0]?.price?.lookup_key ?? ""] === "pro");
+  return subscriptions
+    .filter((sub) => PAYING_STATUSES.includes(sub.status))
+    .sort((a, b) => isPro(b) - isPro(a));
 }
