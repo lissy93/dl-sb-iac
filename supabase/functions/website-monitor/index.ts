@@ -116,11 +116,12 @@ serve(async (req: Request) => {
       );
     }
 
-    // Step 2: Fetch domains owned by pro users
+    // Step 2: Fetch domains owned by pro users, with monitoring on
     const { data: domains, error: domainError } = await supabase
       .from("domains")
       .select("id, domain_name, user_id")
-      .in("user_id", userIds);
+      .in("user_id", userIds)
+      .eq("monitor_enabled", true);
 
     if (domainError) {
       logger.error(`Error fetching domains: ${domainError.message}`);
