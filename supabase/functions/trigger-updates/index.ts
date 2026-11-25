@@ -64,14 +64,15 @@ async function processBatch(
   return results.filter((ok) => !ok).length;
 }
 
-// Process every domain in batches; parallel within a batch, sequential between.
+// Process domains with updates on in batches, parallel within each, sequential between
 // Partial failures are reported in the summary, total failure fails the run.
 async function processAllDomains(req: Request) {
   const supabase = getSupabaseClient(req);
   const startTime = performance.now();
   const { data: domains, error } = await supabase
     .from("domains")
-    .select("user_id, domain_name");
+    .select("user_id, domain_name")
+    .eq("updates_enabled", true);
 
   if (error || !domains) {
     console.error("Error fetching domains:", error?.message);

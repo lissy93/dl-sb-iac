@@ -19,7 +19,8 @@ serve(async (req) => {
     const { data: domains, error } = await supabase
       .from("domains")
       .select("id, domain_name, expiry_date, user_id, registrars(name)")
-      .eq("expiry_date", dateStr);
+      .eq("expiry_date", dateStr)
+      .is("archived_at", null);
 
     if (error) {
       console.error(`❌ Failed to query domains for ${days}d:`, error);

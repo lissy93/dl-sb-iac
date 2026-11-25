@@ -32,7 +32,8 @@ serve(async (req) => {
       user_id,
       registrars(name, url)
     `)
-    .eq("expiry_date", dateStr);
+    .eq("expiry_date", dateStr)
+    .is("archived_at", null);
 
   if (error) {
     console.error("❌ Error querying domains:", error);
